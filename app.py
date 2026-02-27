@@ -4,8 +4,8 @@ from ortools.sat.python import cp_model
 import io
 
 st.set_page_config(page_title="自動シフト作成アプリ", layout="wide")
-st.title("🌟 AI自動シフト作成アプリ (フェーズ3.1：条件緩和テスト)")
-st.write("「夜勤セット」＋「夜勤の必要人数」＋「リーダー配置」を計算します！")
+st.title("🌟 AI自動シフト作成アプリ (フェーズ3.2：夜勤完全ロック版)")
+st.write("「夜勤セットのズル防止」＋「夜勤の必要人数」＋「リーダー配置」を計算します！")
 
 uploaded_file = st.file_uploader("エクセルファイル (.xlsx) を選択", type=["xlsx"])
 
@@ -24,9 +24,7 @@ if uploaded_file:
         
         night_req_row = df_req[df_req.iloc[:, 0] == "夜勤人数"]
         if not night_req_row.empty:
-            # エクセルのB列(インデックス1)以降から、日数分だけ数字を取得する。
             night_req_values = night_req_row.iloc[0, 1:].dropna().tolist()
-            # もし数字が足りなければ、最後の数字（または2）で埋める
             last_val = night_req_values[-1] if night_req_values else 2
             night_req_list = night_req_values + [last_val] * (num_days - len(night_req_values))
         else:
@@ -34,8 +32,8 @@ if uploaded_file:
             
         st.success(f"✅ {num_staff}名のスタッフデータを読み込みました。計算を開始します...")
         
-        if st.button("シフトを自動作成する！（フェーズ3.1🔥）"):
-            with st.spinner('AI店長が複雑なパズルを解いています...'):
+        if st.button("シフトを自動作成する！（フェーズ3.2🔥）"):
+            with st.spinner('AI店長がパズルを解いています...'):
                 
                 model = cp_model.CpModel()
                 shift_types = ['A', 'D', 'E', '公']
@@ -51,13 +49,19 @@ if uploaded_file:
                     for d in range(num_days):
                         model.AddExactlyOne(shifts[(e, d, s)] for s in shift_types)
                         
-                # ルール2: 夜勤セット（D -> E -> 公） ※月末のはみ出しも許容する（翌月のことは一旦気にしない）
+                # 🛡️ ルール2: 夜勤セットの【完全ロック】
                 for e in range(num_staff):
+                    # 初日は「E(明け)」になることは絶対にない（前日のDがないため）
+                    model.Add(shifts[(e, 0, 'E')] == 0)
+                    
                     for d in range(num_days):
+                        # ① 「E」は必ず「昨日のD」の後にしか出現しない（かつ昨日Dなら絶対今日E）
+                        if d > 0:
+                            model.Add(shifts[(e, d, 'E')] == shifts[(e, d-1, 'D')])
+                            
+                        # ② 「E」の翌日は必ず「公」になる（普通の公休は他に入れてもOK）
                         if d + 1 < num_days:
-                            model.AddImplication(shifts[(e, d, 'D')], shifts[(e, d+1, 'E')])
-                        if d + 2 < num_days:
-                            model.AddImplication(shifts[(e, d+1, 'E')], shifts[(e, d+2, '公')])
+                            model.AddImplication(shifts[(e, d, 'E')], shifts[(e, d+1, '公')])
 
                 # ルール3: 毎日の「夜勤(D)」の必要人数を守る
                 for d in range(num_days):
@@ -77,11 +81,11 @@ if uploaded_file:
                     model.Add(leadership_score >= 2)
 
                 solver = cp_model.CpSolver()
-                solver.parameters.max_time_in_seconds = 15.0 # タイマーを少し長めに
+                solver.parameters.max_time_in_seconds = 15.0 
                 status = solver.Solve(model)
                 
                 if status == cp_model.OPTIMAL or status == cp_model.FEASIBLE:
-                    st.success("✨シフトが完成しました！✨ リーダー/サブの配置も完璧です！")
+                    st.success("✨シフトが完成しました！✨ AIのズルを完全に封じ込めました！")
                     
                     result_data = []
                     for e in range(num_staff):
@@ -103,7 +107,8 @@ if uploaded_file:
                     st.download_button(
                         label="📥 完成したシフトをダウンロード",
                         data=processed_data,
-                        file_name="完成版_フェーズ3.xlsx"
+                        file_name="完成版_フェーズ3.2.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                     )
                 else:
                     st.error("❌ 条件が厳しすぎてシフトが組めませんでした。スタッフ人数を増やすか、夜勤の必要人数を減らしたエクセルで再度試してください。")
