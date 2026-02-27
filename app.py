@@ -4,8 +4,8 @@ from ortools.sat.python import cp_model
 import io
 
 st.set_page_config(page_title="自動シフト作成アプリ", layout="wide")
-st.title("🌟 AI自動シフト作成アプリ (フェーズ4：希望休と公休回数)")
-st.write("「夜勤ロック」＋「日勤・夜勤の人数」＋「希望休の取得」＋「公休回数」を計算します！")
+st.title("🌟 AI自動シフト作成アプリ (フェーズ4.1：ズレ防止・完全一致版)")
+st.write("希望休や人数の「ズレ」を修正し、正確にシフトを組みます！")
 
 uploaded_file = st.file_uploader("エクセルファイル (.xlsx) を選択", type=["xlsx"])
 
@@ -15,32 +15,40 @@ if uploaded_file:
         df_history = pd.read_excel(uploaded_file, sheet_name="希望休・先月履歴")
         df_req = pd.read_excel(uploaded_file, sheet_name="必要人数設定")
         
-        staff_names = df_staff["スタッフ名"].tolist()
+        # --- 1. データの安全な読み込み（ズレ防止） ---
+        staff_names = df_staff["スタッフ名"].dropna().tolist()
         staff_roles = df_staff["役割"].fillna("一般").tolist()
-        
-        # 公休回数を取得（空白ならとりあえず8回にする）
-        if "公休回数" in df_staff.columns:
-            staff_off_days = df_staff["公休回数"].fillna(8).tolist()
-        else:
-            staff_off_days = [8] * len(staff_names)
-            
+        staff_off_days = df_staff["公休回数"].fillna(8).tolist() if "公休回数" in df_staff.columns else [8]*len(staff_names)
         num_staff = len(staff_names)
         
-        date_columns = [col for col in df_history.columns if col != "スタッフ名" and not str(col).startswith("Unnamed")]
+        # 「必要人数設定」シートのB列以降（日付）をカレンダーの基準にする
+        date_columns = [col for col in df_req.columns if col != df_req.columns[0] and not str(col).startswith("Unnamed")]
         num_days = len(date_columns)
         
-        # 夜勤人数の取得
+        # 毎日の必要人数を「日付」と一致させて取得する
         night_req_row = df_req[df_req.iloc[:, 0] == "夜勤人数"]
-        night_req_list = night_req_row.iloc[0, 1:].dropna().tolist() + [2]*num_days if not night_req_row.empty else [2]*num_days
-        
-        # 日勤人数の取得（新機能！）
         day_req_row = df_req[df_req.iloc[:, 0] == "日勤人数"]
-        day_req_list = day_req_row.iloc[0, 1:].dropna().tolist() + [3]*num_days if not day_req_row.empty else [3]*num_days
-            
-        st.success(f"✅ {num_staff}名のデータ、希望休、必要人数を読み込みました！")
         
-        if st.button("シフトを自動作成する！（フェーズ4🔥）"):
-            with st.spinner('AI店長がみんなの希望休と人数パズルを解いています...（最大20秒）'):
+        night_req_list = []
+        day_req_list = []
+        for col in date_columns:
+            # 夜勤人数
+            if not night_req_row.empty and col in night_req_row.columns:
+                val = night_req_row[col].values[0]
+                night_req_list.append(int(val) if pd.notna(val) else 2)
+            else:
+                night_req_list.append(2)
+            # 日勤人数
+            if not day_req_row.empty and col in day_req_row.columns:
+                val = day_req_row[col].values[0]
+                day_req_list.append(int(val) if pd.notna(val) else 3)
+            else:
+                day_req_list.append(3)
+            
+        st.success(f"✅ {num_staff}名のスタッフと、{num_days}日分のカレンダーを正確に認識しました！")
+        
+        if st.button("シフトを自動作成する！（フェーズ4.1🔥）"):
+            with st.spinner('AI店長がみんなの希望休と人数パズルを解いています...'):
                 
                 model = cp_model.CpModel()
                 shift_types = ['A', 'D', 'E', '公']
@@ -51,12 +59,12 @@ if uploaded_file:
                         for s in shift_types:
                             shifts[(e, d, s)] = model.NewBoolVar(f'shift_{e}_{d}_{s}')
                             
-                # ルール1: 毎日必ずどれか1つの勤務
+                # ルール1: 毎日必ずどれか1つ
                 for e in range(num_staff):
                     for d in range(num_days):
                         model.AddExactlyOne(shifts[(e, d, s)] for s in shift_types)
                         
-                # ルール2: 夜勤セットの【完全ロック】
+                # ルール2: 夜勤セットの完全ロック
                 for e in range(num_staff):
                     model.Add(shifts[(e, 0, 'E')] == 0)
                     for d in range(num_days):
@@ -67,11 +75,11 @@ if uploaded_file:
 
                 # ルール3: 毎日の「夜勤(D)」の必要人数
                 for d in range(num_days):
-                    model.Add(sum(shifts[(e, d, 'D')] for e in range(num_staff)) == int(night_req_list[d]))
+                    model.Add(sum(shifts[(e, d, 'D')] for e in range(num_staff)) == night_req_list[d])
 
-                # 🌟 ルール4: 毎日の「日勤(A)」の必要人数（指定人数"以上"配置する）
+                # ルール4: 毎日の「日勤(A)」の必要人数（指定人数"以上"）
                 for d in range(num_days):
-                    model.Add(sum(shifts[(e, d, 'A')] for e in range(num_staff)) >= int(day_req_list[d]))
+                    model.Add(sum(shifts[(e, d, 'A')] for e in range(num_staff)) >= day_req_list[d])
 
                 # ルール5: リーダー配置（日勤にリーダー1名orサブ2名）
                 for d in range(num_days):
@@ -81,19 +89,22 @@ if uploaded_file:
                     )
                     model.Add(leadership_score >= 2)
 
-                # 🌟 ルール6: 希望休の絶対反映
-                for e in range(num_staff):
-                    for d in range(num_days):
-                        # エクセルの該当マスの文字を取得
-                        cell_value = str(df_history.iloc[e, d+1]).strip()
-                        if cell_value == "公":
-                            # もしエクセルに「公」と書いてあったら、絶対に「公休」にする！
-                            model.Add(shifts[(e, d, '公')] == 1)
+                # 🌟 ルール6: 希望休の「完全ピンポイント検索（VLOOKUP方式）」
+                for e, staff_name in enumerate(staff_names):
+                    for d, date_col in enumerate(date_columns):
+                        # 希望休シートにこの日付（例: 1, 2, 3...）の列があるか確認
+                        if date_col in df_history.columns:
+                            # スタッフ名を検索して行を特定
+                            target_row = df_history[df_history["スタッフ名"] == staff_name]
+                            if not target_row.empty:
+                                cell_value = str(target_row[date_col].values[0]).strip()
+                                if cell_value == "公":
+                                    # 見つけたら絶対に休みにする
+                                    model.Add(shifts[(e, d, '公')] == 1)
 
-                # 🌟 ルール7: 月間の「公休回数」ノルマを達成する
+                # ルール7: 公休回数のノルマ
                 for e in range(num_staff):
                     target_off = int(staff_off_days[e])
-                    # 1ヶ月の「公」の合計が、エクセルの公休回数とピッタリ一致すること！
                     model.Add(sum(shifts[(e, d, '公')] for d in range(num_days)) == target_off)
 
                 solver = cp_model.CpSolver()
@@ -101,7 +112,7 @@ if uploaded_file:
                 status = solver.Solve(model)
                 
                 if status == cp_model.OPTIMAL or status == cp_model.FEASIBLE:
-                    st.success("✨シフトが完成しました！✨ 希望休も公休回数も完璧に守られています！")
+                    st.success("✨シフトが完成しました！✨ 希望休も人数もズレなく反映されています！")
                     
                     result_data = []
                     for e in range(num_staff):
@@ -123,11 +134,11 @@ if uploaded_file:
                     st.download_button(
                         label="📥 完成したシフトをダウンロード",
                         data=processed_data,
-                        file_name="完成版_フェーズ4.xlsx",
+                        file_name="完成版_ズレ修正版.xlsx",
                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                     )
                 else:
-                    st.error("❌ 条件が厳しすぎて組めませんでした。（原因例：公休希望が多すぎる、人数が足りない、など）")
+                    st.error("❌ 条件が厳しすぎて組めませんでした。（希望休が重なりすぎて人数が足りないなど）")
                     
     except Exception as e:
         st.error(f"⚠️ エラーが発生しました: {e}")
