@@ -9,7 +9,26 @@ from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
 
 st.set_page_config(page_title="自動シフト作成アプリ", layout="wide")
 st.title("🤝 AIシフト作成 Co-Pilot")
-st.write("「定時確保」や「残業の逆比例公平化」を搭載した、実務完全対応のシフト作成システムです。")
+st.write("現場のルールと思いやりを考慮して、AIと一緒にシフトを作るシステムです。")
+
+# 🌟 NEW: スマホユーザーのための便利リンクエリア
+with st.expander("📱 【事前準備】入力用エクセルをお持ちでない方へ", expanded=True):
+    st.markdown("""
+    **方法1：クラウドで入力する（おすすめ）**
+    以下のリンクからGoogleスプレッドシートを開き、スマホで直接入力してください。
+    入力後、`ファイル ＞ ダウンロード ＞ Microsoft Excel (.xlsx)` を選んで保存してください。
+    👉 [入力用スプレッドシートを開く（※ここにあなたのスプレッドシートのURLを貼れます）](#)
+    """)
+    
+    st.markdown("**方法2：空のテンプレートをダウンロードして使う**")
+    # 空のデータフレームを作ってエクセル化し、ダウンロードさせる
+    output_tmpl = io.BytesIO()
+    with pd.ExcelWriter(output_tmpl, engine='openpyxl') as writer:
+        pd.DataFrame(columns=["スタッフ名", "役割", "公休数", "夜勤可否", "夜勤上限", "残業可否", "日曜Dカウント", "日曜Eカウント", "パート", "妥協優先度", "定時確保数"]).to_excel(writer, index=False, sheet_name='スタッフ設定')
+        pd.DataFrame(columns=["スタッフ名", "前月27", "前月28", "前月29", "前月30", "前月31", "1", "2", "3", "4", "5"]).to_excel(writer, index=False, sheet_name='希望休・前月履歴')
+        pd.DataFrame({"項目": ["曜日", "日勤人数", "夜勤人数", "残業人数", "絶対確保"], "1": ["月", 3, 2, 0, ""], "2": ["火", 3, 2, 0, ""]}).to_excel(writer, index=False, sheet_name='日別設定')
+    st.download_button(label="📥 空のテンプレート（.xlsx）をダウンロード", data=output_tmpl.getvalue(), file_name="入力用テンプレート.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
 
 if 'needs_compromise' not in st.session_state:
     st.session_state.needs_compromise = False
@@ -312,7 +331,7 @@ if uploaded_file:
                         st.session_state.needs_compromise = True
                         st.rerun()
         else:
-            st.error("⚠️ 【AIからのご報告】申し訳ありません。現在の条件では、ルールを完璧に守ってシフトを組むことは不可能でした...")
+            st.error("⚠️ 【AI店長からのご報告】\n申し訳ありません。現在の人数と希望休では、すべてのルールを完璧に守ってシフトを組むことは不可能でした...")
             st.warning("💡 以下のいずれかの「妥協案」を許可して、再計算を指示してください。")
             
             with st.container():
@@ -329,8 +348,10 @@ if uploaded_file:
                 
                 st.markdown("**■ その他の例外ルール**")
                 col3, col4 = st.columns(2)
-                with col3: allow_night_consec_3 = st.checkbox("やむを得ない「月またぎ含む、夜勤セット3連続」を許可する")
-                with col4: allow_ot_consec = st.checkbox("やむを得ない「残業(A残)の2日連続」を許可する")
+                with col3:
+                    allow_night_consec_3 = st.checkbox("やむを得ない「月またぎ含む、夜勤セット3連続」を許可する")
+                with col4:
+                    allow_ot_consec = st.checkbox("やむを得ない「残業(A残)の2日連続」を許可する")
 
             if st.button("🔄 【STEP 3】チェックした妥協案を許可して、3パターンのシフトを作る！"):
                 with st.spinner('許可された妥協案をもとに、AIが再計算しています...'):
@@ -370,27 +391,30 @@ if uploaded_file:
 
                     df_res['日勤(A/P)回数'] = df_res[cols].apply(lambda x: x.str.contains('A|P|Ｐ', na=False) & ~x.str.contains('残', na=False)).sum(axis=1)
                     df_res['残業(A残)回数'] = (df_res[cols] == 'A残').sum(axis=1)
+                    df_res['残業割合(%)'] = df_res.apply(lambda r: f"{(r['残業(A残)回数']/r['日勤(A/P)回数'])*100:.1f}%" if r['日勤(A/P)回数']>0 else "0.0%", axis=1)
                     df_res['夜勤(D)回数'] = (df_res[cols] == 'D').sum(axis=1)
                     df_res['公休回数'] = (df_res[cols] == '公').sum(axis=1)
+                    df_res['日曜D回数'] = [sum(1 for d in range(num_days) if '日' in weekdays[d] and df_res.loc[e, cols[d]] == 'D') if staff_sun_d[e] == "〇" else 0 for e in range(num_staff)]
+                    df_res['日曜E回数'] = [sum(1 for d in range(num_days) if '日' in weekdays[d] and df_res.loc[e, cols[d]] == 'E') if staff_sun_e[e] == "〇" else 0 for e in range(num_staff)]
 
                     sum_A = {"スタッフ名": "【日勤(A/P) 合計人数】"}
                     sum_Az = {"スタッフ名": "【残業(A残) 合計人数】"}
+                    sum_D = {"スタッフ名": "【夜勤(D) 合計人数】"}
+                    sum_O = {"スタッフ名": "【公休 合計人数】"}
                     
-                    for c in ['日勤(A/P)回数', '残業(A残)回数', '夜勤(D)回数', '公休回数']:
-                        sum_A[c] = ""; sum_Az[c] = ""
+                    for c in ['日勤(A/P)回数', '残業(A残)回数', '残業割合(%)', '夜勤(D)回数', '公休回数', '日曜D回数', '日曜E回数']:
+                        sum_A[c] = ""; sum_Az[c] = ""; sum_D[c] = ""; sum_O[c] = ""
 
                     for d, c in enumerate(cols):
                         sum_A[c] = sum(1 for e in range(num_staff) if str(df_res.loc[e, c]) in ['A', 'A残'] or 'P' in str(df_res.loc[e, c]) and "新人" not in str(staff_roles[e]))
                         sum_Az[c] = (df_res[c] == 'A残').sum()
+                        sum_D[c] = (df_res[c] == 'D').sum()
+                        sum_O[c] = (df_res[c] == '公').sum()
 
-                    df_fin = pd.concat([df_res, pd.DataFrame([sum_A, sum_Az])], ignore_index=True)
+                    df_fin = pd.concat([df_res, pd.DataFrame([sum_A, sum_Az, sum_D, sum_O])], ignore_index=True)
 
                     def highlight_warnings(df):
                         styles = pd.DataFrame('', index=df.index, columns=df.columns)
-                        for d, col_name in enumerate(cols):
-                            if "土" in col_name: styles.iloc[:, d+1] = 'background-color: #E6F2FF;'
-                            elif "日" in col_name or "祝" in col_name: styles.iloc[:, d+1] = 'background-color: #FFE6E6;'
-                        
                         for d, col_name in enumerate(cols):
                             actual_a = df.loc[len(staff_names), col_name]
                             target_a = day_req_list[d]
@@ -406,26 +430,25 @@ if uploaded_file:
                                     return v == 'A' or v == 'A残' or 'P' in v or 'Ｐ' in v
 
                                 if is_day_work(d) and is_day_work(d+1) and is_day_work(d+2) and is_day_work(d+3):
-                                    styles.loc[e, cols[d]] = 'background-color: #FFFF99; font-weight: bold; color: black;'
-                                    styles.loc[e, cols[d+1]] = 'background-color: #FFFF99; font-weight: bold; color: black;'
-                                    styles.loc[e, cols[d+2]] = 'background-color: #FFFF99; font-weight: bold; color: black;'
-                                    styles.loc[e, cols[d+3]] = 'background-color: #FFFF99; font-weight: bold; color: black;'
+                                    styles.loc[e, cols[d]] = 'background-color: #FFFF99;'
+                                    styles.loc[e, cols[d+1]] = 'background-color: #FFFF99;'
+                                    styles.loc[e, cols[d+2]] = 'background-color: #FFFF99;'
+                                    styles.loc[e, cols[d+3]] = 'background-color: #FFFF99;'
 
                                 if d + 3 < num_days:
                                     if is_day_work(d) and is_day_work(d+1) and is_day_work(d+2) and str(df.loc[e, cols[d+3]]) == 'D':
-                                        styles.loc[e, cols[d]] = 'background-color: #FFD580; font-weight: bold; color: black;'
-                                        styles.loc[e, cols[d+1]] = 'background-color: #FFD580; font-weight: bold; color: black;'
-                                        styles.loc[e, cols[d+2]] = 'background-color: #FFD580; font-weight: bold; color: black;'
-                                        styles.loc[e, cols[d+3]] = 'background-color: #FFD580; font-weight: bold; color: black;'
+                                        styles.loc[e, cols[d]] = 'background-color: #FFD580;'
+                                        styles.loc[e, cols[d+1]] = 'background-color: #FFD580;'
+                                        styles.loc[e, cols[d+2]] = 'background-color: #FFD580;'
+                                        styles.loc[e, cols[d+3]] = 'background-color: #FFD580;'
                                         
                                 if d + 8 < num_days:
                                     if str(df.loc[e, cols[d]]) == 'D' and str(df.loc[e, cols[d+3]]) == 'D' and str(df.loc[e, cols[d+6]]) == 'D':
-                                        for k in range(9): styles.loc[e, cols[d+k]] = 'background-color: #E6E6FA; font-weight: bold; color: black;'
+                                        for k in range(9): styles.loc[e, cols[d+k]] = 'background-color: #E6E6FA;'
                         return styles
 
                     st.dataframe(df_fin.style.apply(highlight_warnings, axis=None))
                     
-                    # 🌟 エクセル出力時のレイアウト変更（メイリオ、中央揃え、細罫線）
                     output = io.BytesIO()
                     with pd.ExcelWriter(output, engine='openpyxl') as writer:
                         df_fin.to_excel(writer, index=False, sheet_name='完成シフト')
@@ -444,15 +467,11 @@ if uploaded_file:
                         fill_n3 = PatternFill(start_color="FFD580", end_color="FFD580", fill_type="solid")
                         fill_n3_consec = PatternFill(start_color="E6E6FA", end_color="E6E6FA", fill_type="solid")
 
-                        # 全セルへのフォント・罫線・配置の適用
                         for row in worksheet.iter_rows(min_row=1, max_row=worksheet.max_row, min_col=1, max_col=worksheet.max_column):
                             for cell in row:
                                 cell.font = font_meiryo
                                 cell.border = border_thin
-                                if cell.column == 1: # A列（スタッフ名）
-                                    cell.alignment = align_left
-                                else: # B列以降
-                                    cell.alignment = align_center
+                                cell.alignment = align_left if cell.column == 1 else align_center
 
                         for c_idx, col_name in enumerate(cols):
                             if "土" in col_name:
@@ -490,7 +509,7 @@ if uploaded_file:
                     st.download_button(
                         label=f"📥 【パターン {i+1}】 をエクセルでダウンロード（レイアウト完成版）",
                         data=processed_data,
-                        file_name=f"完成版_レイアウト適用シフト_{i+1}.xlsx",
+                        file_name=f"完成版_対話型シフト_{i+1}.xlsx",
                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                         key=f"dl_btn_{i}"
                     )
