@@ -7,11 +7,12 @@ import datetime
 import random
 
 st.set_page_config(page_title="自動シフト作成アプリ", layout="wide")
-st.title("🤝 AIシフト作成 Co-Pilot (フェーズ21：スタッフへの思いやり版)")
-st.write("「基本は2連休まで」「全員に月1回は2連休をプレゼントする」という優しいルールを追加しました！")
+st.title("🤝 AIシフト作成 Co-Pilot (フェーズ22：常時3パターン提案版)")
+st.write("どんな時でも、現場が選びやすいように「3パターンの完成シフト」を同時に提案します！")
 
 # 状態管理
-if 'needs_compromise' not in st.session_state: st.session_state.needs_compromise = False
+if 'needs_compromise' not in st.session_state:
+    st.session_state.needs_compromise = False
 
 st.write("---")
 today = datetime.date.today()
@@ -37,7 +38,8 @@ if uploaded_file:
                 if col_name in df_staff.columns and pd.notna(df_staff[col_name].iloc[i]):
                     val = df_staff[col_name].iloc[i]
                     res.append(int(val) if is_int else str(val).strip())
-                else: res.append(default_val)
+                else:
+                    res.append(default_val)
             return res
 
         staff_roles = get_staff_col("役割", "一般")
@@ -83,7 +85,7 @@ if uploaded_file:
 
         weekdays = [str(df_req.iloc[0, d+1]).strip() if (d+1) < len(df_req.columns) and pd.notna(df_req.iloc[0, d+1]) else "" for d in range(num_days)]
 
-        st.success("✅ データの読み込み完了！スタッフへの「思いやり」を込めて計算します。")
+        st.success("✅ データの読み込み完了！まずは妥協なしの「理想のシフト」を作れるかテストします。")
 
         def solve_shift(random_seed, allow_minus_1=False, allow_4_days=False, allow_night_3=False, allow_sub_only=False, allow_ot_consec=False, allow_night_consec_3=False):
             model = cp_model.CpModel()
@@ -100,6 +102,7 @@ if uploaded_file:
                 if staff_overtime_ok[e] == "×":
                     for d in range(num_days): model.Add(shifts[(e, d, 'A残')] == 0)
 
+            # 前月履歴
             for e, staff_name in enumerate(staff_names):
                 tr = df_history[df_history.iloc[:, 0] == staff_name]
                 if not tr.empty:
@@ -107,8 +110,10 @@ if uploaded_file:
                     if last_day == "D":
                         model.Add(shifts[(e, 0, 'E')] == 1)
                         if num_days > 1: model.Add(shifts[(e, 1, '公')] == 1)
-                    elif last_day == "E": model.Add(shifts[(e, 0, '公')] == 1)
+                    elif last_day == "E":
+                        model.Add(shifts[(e, 0, '公')] == 1)
 
+            # 夜勤セットの絶対ルール
             for e in range(num_staff):
                 if staff_night_ok[e] != "×":
                     tr = df_history[df_history.iloc[:, 0] == staff_names[e]]
@@ -121,22 +126,7 @@ if uploaded_file:
 
             penalties = []
             
-            # 夜勤ループと3連続防止
-            for e in range(num_staff):
-                if staff_night_ok[e] != "×":
-                    for d in range(num_days - 3): model.Add(shifts[(e, d, 'E')] + shifts[(e, d+1, '公')] + shifts[(e, d+2, '公')] + shifts[(e, d+3, 'D')] <= 3)
-                    for d in range(num_days - 4): model.Add(shifts[(e, d, 'E')] + shifts[(e, d+1, '公')] + shifts[(e, d+2, '公')] + shifts[(e, d+3, '公')] + shifts[(e, d+4, 'D')] <= 4)
-                    
-                    tr = df_history[df_history.iloc[:, 0] == staff_names[e]]
-                    if not tr.empty and tr.shape[1] > 5:
-                        l_5 = [str(tr.iloc[0, i]).strip() for i in range(1, 6)]
-                        if l_5[4] == "E":
-                            if num_days > 2: model.Add(shifts[(e, 0, '公')] + shifts[(e, 1, '公')] + shifts[(e, 2, 'D')] <= 2)
-                            if num_days > 3: model.Add(shifts[(e, 0, '公')] + shifts[(e, 1, '公')] + shifts[(e, 2, '公')] + shifts[(e, 3, 'D')] <= 3)
-                        if l_5[3] == "E" and l_5[4] == "公":
-                            if num_days > 1: model.Add(shifts[(e, 0, '公')] + shifts[(e, 1, 'D')] <= 1)
-                            if num_days > 2: model.Add(shifts[(e, 0, '公')] + shifts[(e, 1, '公')] + shifts[(e, 2, 'D')] <= 2)
-
+            # 月またぎを考慮した夜勤3連続の防止
             for e, staff_name in enumerate(staff_names):
                 if staff_night_ok[e] != "×":
                     past_D = [0] * 5
@@ -157,6 +147,7 @@ if uploaded_file:
                                 model.Add(sum(window) <= 2).OnlyEnforceIf(n3_var.Not())
                                 penalties.append(n3_var * 5000)
 
+            # 日勤人数の誘導
             for d in range(num_days):
                 model.Add(sum(shifts[(e, d, 'D')] for e in range(num_staff)) == night_req_list[d])
                 model.Add(sum(shifts[(e, d, 'A残')] for e in range(num_staff)) == overtime_req_list[d])
@@ -205,6 +196,7 @@ if uploaded_file:
                     model.Add(l_score == 1).OnlyEnforceIf(sub_var)
                     penalties.append(sub_var * 1000)
 
+            # 希望休・回数ノルマ
             for e, staff_name in enumerate(staff_names):
                 tr = df_history[df_history.iloc[:, 0] == staff_name]
                 if not tr.empty:
@@ -218,6 +210,7 @@ if uploaded_file:
                 if staff_night_ok[e] != "×":
                     model.Add(sum(shifts[(e, d, 'D')] for d in range(num_days)) <= int(staff_night_limits[e]))
 
+            # 夜勤回数の厳格な公平化
             limit_groups = {}
             for e in range(num_staff):
                 if staff_night_ok[e] != "×":
@@ -234,18 +227,14 @@ if uploaded_file:
 
             # 🌟 思いやりの連休コントロール（2連休推奨・3連休防止）
             for e in range(num_staff):
-                # 4連休以上は絶対に禁止（ハード制約）
-                for d in range(num_days - 3):
-                    model.Add(shifts[(e, d, '公')] + shifts[(e, d+1, '公')] + shifts[(e, d+2, '公')] + shifts[(e, d+3, '公')] <= 3)
+                for d in range(num_days - 3): model.Add(shifts[(e, d, '公')] + shifts[(e, d+1, '公')] + shifts[(e, d+2, '公')] + shifts[(e, d+3, '公')] <= 3)
 
-                # 3連休の防止（ソフト制約：希望休以外で作ってしまったら罰金）
                 for d in range(num_days - 2):
                     is_3_off = model.NewBoolVar('')
                     model.Add(shifts[(e, d, '公')] + shifts[(e, d+1, '公')] + shifts[(e, d+2, '公')] == 3).OnlyEnforceIf(is_3_off)
                     model.Add(shifts[(e, d, '公')] + shifts[(e, d+1, '公')] + shifts[(e, d+2, '公')] <= 2).OnlyEnforceIf(is_3_off.Not())
-                    penalties.append(is_3_off * 500) # 希望休以外で3連休を作ったら罰金500
+                    penalties.append(is_3_off * 500) 
 
-                # 🌟 2連休のプレゼント（全員に最低1回は2連休を作ってあげる努力）
                 is_2_offs = []
                 for d in range(num_days - 1):
                     is_2_off = model.NewBoolVar('')
@@ -254,9 +243,9 @@ if uploaded_file:
                     is_2_offs.append(is_2_off)
                 
                 has_any_2_off = model.NewBoolVar('')
-                model.Add(sum(is_2_offs) >= 1).OnlyEnforceIf(has_any_2_off) # 1回以上2連休があるか？
+                model.Add(sum(is_2_offs) >= 1).OnlyEnforceIf(has_any_2_off) 
                 model.Add(sum(is_2_offs) == 0).OnlyEnforceIf(has_any_2_off.Not())
-                penalties.append(has_any_2_off.Not() * 300) # 2連休が1回もない人を作ってしまったら罰金300
+                penalties.append(has_any_2_off.Not() * 300) 
 
             for e in range(num_staff):
                 target_lvl = staff_comp_lvl[e]
@@ -327,13 +316,18 @@ if uploaded_file:
             if status == cp_model.OPTIMAL or status == cp_model.FEASIBLE: return solver, shifts
             else: return None, None
 
+        # 🌟 UI分岐処理
         if not st.session_state.needs_compromise:
-            if st.button("▶️ 【STEP 1】まずは妥協なしで理想のシフトを計算する"):
-                with st.spinner('AIが「妥協なし」の完璧なシフトを模索中...'):
-                    solver, shifts = solve_shift(42, False, False, False, False, False, False)
-                    if solver:
-                        st.success("🎉 なんと！妥協なしで完璧なシフトが組めました！")
-                        results = [(solver, shifts)]
+            if st.button("▶️ 【STEP 1】まずは妥協なしで理想のシフトを計算する（3パターン）"):
+                with st.spinner('AIが「妥協なし」の完璧なシフトを3パターン模索中...'):
+                    results = []
+                    # 🌟 成功時も最初から3回計算する！
+                    for seed in [1, 42, 99]:
+                        solver, shifts = solve_shift(seed, False, False, False, False, False, False)
+                        if solver: results.append((solver, shifts))
+                        
+                    if results:
+                        st.success(f"🎉 なんと！妥協なしで完璧なシフトが {len(results)} パターン組めました！")
                     else:
                         st.session_state.needs_compromise = True
                         st.rerun()
@@ -372,6 +366,7 @@ if uploaded_file:
                         st.success(f"✨ ありがとうございます！許可いただいた条件内で、{len(results)}パターンのシフトが完成しました！")
                         st.session_state.needs_compromise = False
 
+        # --- 結果の描画（STEP1成功時、STEP3成功時共通） ---
         if 'results' in locals() and results:
             cols = []
             for d_val, w_val in zip(date_columns, weekdays):
