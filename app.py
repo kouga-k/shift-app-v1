@@ -7,7 +7,7 @@ import datetime
 from openpyxl.styles import PatternFill
 
 st.set_page_config(page_title="自動シフト作成アプリ", layout="wide")
-st.title("🌟 AI自動シフト作成アプリ (フェーズ10：厳格モード＆警告ハイライト版)")
+st.title("🌟 AI自動シフト作成アプリ (フェーズ10.1：バグ修正＆厳格モード)")
 st.write("AIの勝手な妥協を禁止し、イレギュラーが発生した箇所を「色」で警告します！")
 
 # --- 妥協案のセッション管理 ---
@@ -90,7 +90,7 @@ if uploaded_file:
 
         st.success(f"✅ データの読み込み完了！AIの勝手な妥協を禁止し、厳格モードで準備しました。")
         
-        # 💬 AIからのご相談エリア（日勤人数の妥協を追加）
+        # 💬 AIからのご相談エリア
         with st.expander("📩 AI店長への特別許可（※エラーで組めない時だけチェックを入れてください）", expanded=True):
             st.warning("👩‍💼 **AI店長からのご相談:**\n\n『基本はルールを100%死守して時間をかけて考えます！でも、どうしても無理な場合だけ、以下の妥協を許可してください💦』")
             col1, col2 = st.columns(2)
@@ -156,16 +156,12 @@ if uploaded_file:
                         shifts[(e, d, 'A')] for e in range(num_staff) if "新人" not in str(staff_roles[e])
                     )
                     
-                    # 🌟 勝手な妥協を禁止！
                     if absolute_req_list[d] == "〇":
-                        # 絶対確保日は、妥協チェックが入っていても絶対に死守
                         model.Add(actual_day_staff >= day_req_list[d])
                     else:
                         if st.session_state.allow_day_minus_1:
-                            # 人間が許可した時だけ、マイナス1を許容
                             model.Add(actual_day_staff >= day_req_list[d] - 1)
                         else:
-                            # デフォルトは絶対に基本人数を死守
                             model.Add(actual_day_staff >= day_req_list[d])
 
                 # 役割配置
@@ -196,7 +192,7 @@ if uploaded_file:
                     if staff_night_ok[e] != "×":
                         model.Add(sum(shifts[(e, d, 'D')] for d in range(num_days)) <= int(staff_night_limits[e]))
 
-                # 連勤・連休制限
+                # 🌟 バグ修正箇所：連勤・連休制限（文法エラーを修正しました）
                 for e in range(num_staff):
                     for d in range(num_days - 3):
                         model.Add(shifts[(e, d, '公')] + shifts[(e, d+1, '公')] + shifts[(e, d+2, '公')] + shifts[(e, d+3, '公')] <= 3)
@@ -208,10 +204,11 @@ if uploaded_file:
                             model.Add(shifts[(e, d, 'A')] + shifts[(e, d+1, 'A')] + shifts[(e, d+2, 'A')] + shifts[(e, d+3, 'A')] <= 3)
 
                         if st.session_state.allow_night_before_3_days == False:
-                            model.AddImplication(shifts[(e, d+3, 'D')], shifts[(e, d, 'A')] + shifts[(e, d+1, 'A')] + shifts[(e, d+2, 'A')] <= 2)
+                            # 【修正】OR-Toolsの正しい文法（OnlyEnforceIf）を使用
+                            model.Add(shifts[(e, d, 'A')] + shifts[(e, d+1, 'A')] + shifts[(e, d+2, 'A')] <= 2).OnlyEnforceIf(shifts[(e, d+3, 'D')])
 
                 solver = cp_model.CpSolver()
-                # 🌟 時間をたっぷり使う（最大3分＝180秒）
+                # 最大3分（180秒）考える
                 solver.parameters.max_time_in_seconds = 180.0
                 status = solver.Solve(model)
                 
@@ -288,29 +285,24 @@ if uploaded_file:
                     summary_df = pd.DataFrame([summary_A, summary_D, summary_Off])
                     final_df = pd.concat([result_df, summary_df], ignore_index=True)
 
-                    # 🌟 警告のハイライト関数（色付け）
+                    # 🌟 警告ハイライト関数
                     def highlight_warnings(df):
-                        # 出力用と同じサイズの空のDataFrame（スタイル用）を作る
                         styles = pd.DataFrame('', index=df.index, columns=df.columns)
                         
-                        # 1. 毎日の集計行のチェック（日勤人数が設定値を下回っていたら赤）
+                        # 1. 毎日の集計行のチェック（赤色）
                         for d, col_name in enumerate(new_date_columns):
-                            actual_a = df.loc[len(staff_names), col_name] # 集計行のAの数
+                            actual_a = df.loc[len(staff_names), col_name]
                             target_a = day_req_list[d]
-                            if actual_a < target_a:
-                                styles.loc[len(staff_names), col_name] = 'background-color: #FFCCCC; color: red; font-weight: bold;' # 赤色
+                            if actual_a != "" and actual_a < target_a:
+                                styles.loc[len(staff_names), col_name] = 'background-color: #FFCCCC; color: red; font-weight: bold;'
 
                         # 2. 該当スタッフの4連勤、夜勤前3連勤のチェック
                         for e in range(num_staff):
                             for d in range(num_days):
-                                col_name = new_date_columns[d]
-                                val = str(df.loc[e, col_name])
-                                
-                                # 出勤扱い（A, P, D, E）か判定する関数
                                 def is_work(day_idx):
                                     if day_idx >= num_days: return False
                                     v = str(df.loc[e, new_date_columns[day_idx]])
-                                    return v == 'A' or 'P' in v or v == 'D' or v == 'E'
+                                    return v == 'A' or 'P' in v or 'Ｐ' in v or v == 'D' or v == 'E'
 
                                 # 4連勤の検出（黄色）
                                 if is_work(d) and is_work(d+1) and is_work(d+2) and is_work(d+3):
@@ -319,7 +311,7 @@ if uploaded_file:
                                     styles.loc[e, new_date_columns[d+2]] = 'background-color: #FFFF99;'
                                     styles.loc[e, new_date_columns[d+3]] = 'background-color: #FFFF99;'
 
-                                # 夜勤前3連勤（A, A, A, D）の検出（オレンジ）
+                                # 夜勤前3連勤（オレンジ）
                                 if d + 3 < num_days:
                                     v1 = str(df.loc[e, new_date_columns[d]])
                                     v2 = str(df.loc[e, new_date_columns[d+1]])
@@ -330,12 +322,11 @@ if uploaded_file:
                                         styles.loc[e, new_date_columns[d+1]] = 'background-color: #FFD580;'
                                         styles.loc[e, new_date_columns[d+2]] = 'background-color: #FFD580;'
                                         styles.loc[e, new_date_columns[d+3]] = 'background-color: #FFD580;'
-
                         return styles
 
                     st.dataframe(final_df.style.apply(highlight_warnings, axis=None))
                     
-                    # 🌟 エクセル出力での色付け設定
+                    # エクセル出力での色付け設定
                     output = io.BytesIO()
                     with pd.ExcelWriter(output, engine='openpyxl') as writer:
                         final_df.to_excel(writer, index=False, sheet_name='完成シフト')
@@ -345,20 +336,17 @@ if uploaded_file:
                         fill_yellow = PatternFill(start_color="FFFF99", end_color="FFFF99", fill_type="solid")
                         fill_orange = PatternFill(start_color="FFD580", end_color="FFD580", fill_type="solid")
                         
-                        # DataFrameのスタイルを適用するロジック（簡易版）
-                        # ① 日勤人数不足（赤）
                         for d, col_name in enumerate(new_date_columns):
                             actual_a = final_df.loc[len(staff_names), col_name]
-                            if actual_a < day_req_list[d]:
-                                worksheet.cell(row=len(staff_names)+2, column=d+4).fill = fill_red # ヘッダー分などズレ考慮
+                            if actual_a != "" and actual_a < day_req_list[d]:
+                                worksheet.cell(row=len(staff_names)+2, column=d+4).fill = fill_red
 
-                        # ② 連勤チェック（黄・オレンジ）
                         for e in range(num_staff):
                             for d in range(num_days):
                                 def is_work(day_idx):
                                     if day_idx >= num_days: return False
                                     v = str(final_df.loc[e, new_date_columns[day_idx]])
-                                    return v == 'A' or 'P' in v or v == 'D' or v == 'E'
+                                    return v == 'A' or 'P' in v or 'Ｐ' in v or v == 'D' or v == 'E'
 
                                 if is_work(d) and is_work(d+1) and is_work(d+2) and is_work(d+3):
                                     worksheet.cell(row=e+2, column=d+4).fill = fill_yellow
