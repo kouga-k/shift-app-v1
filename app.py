@@ -8,8 +8,8 @@ import random
 from openpyxl.styles import PatternFill
 
 st.set_page_config(page_title="自動シフト作成アプリ", layout="wide")
-st.title("🤝 AIシフト作成 Co-Pilot (フェーズ25：エクセル色付き＆残業バランス版)")
-st.write("エクセル出力時にも色を塗り、残業は「回数を揃える」ことで日勤が少ない人の割合が高くなるよう調整します！")
+st.title("🤝 AIシフト作成 Co-Pilot (フェーズ26：定時確保＆真の残業公平化)")
+st.write("定時(A)を必ず確保し、日勤数に応じた「真の残業割合の公平化」を実現しました！")
 
 if 'needs_compromise' not in st.session_state:
     st.session_state.needs_compromise = False
@@ -103,6 +103,7 @@ if uploaded_file:
                 if staff_overtime_ok[e] == "×":
                     for d in range(num_days): model.Add(shifts[(e, d, 'A残')] == 0)
 
+            # 前月履歴
             for e, staff_name in enumerate(staff_names):
                 tr = df_history[df_history.iloc[:, 0] == staff_name]
                 if not tr.empty:
@@ -113,6 +114,7 @@ if uploaded_file:
                     elif last_day == "E":
                         model.Add(shifts[(e, 0, '公')] == 1)
 
+            # 夜勤セットの絶対ルール
             for e in range(num_staff):
                 if staff_night_ok[e] != "×":
                     tr = df_history[df_history.iloc[:, 0] == staff_names[e]]
@@ -290,6 +292,18 @@ if uploaded_file:
                         model.Add(shifts[(e, d, 'A残')] + shifts[(e, d+1, 'A残')] == 2).OnlyEnforceIf(ot_var)
                         penalties.append(ot_var * 500)
 
+            # 🌟 NEW: 定時(A)の絶対保護（定時0回によるブラック化を防ぐ）
+            for e in range(num_staff):
+                if staff_overtime_ok[e] != "×":
+                    total_day_work = sum(shifts[(e, d, 'A')] + shifts[(e, d, 'A残')] for d in range(num_days))
+                    b_has_work = model.NewBoolVar('')
+                    model.Add(total_day_work > 0).OnlyEnforceIf(b_has_work)
+                    model.Add(total_day_work == 0).OnlyEnforceIf(b_has_work.Not())
+                    
+                    # 日勤に1回でも入るなら、必ず「定時(A)」を最低1回は確保する（全部A残になるのを防ぐ）
+                    total_a_normal = sum(shifts[(e, d, 'A')] for d in range(num_days))
+                    model.Add(total_a_normal >= 1).OnlyEnforceIf(b_has_work)
+
             mid_day = num_days // 2
             for e in range(num_staff):
                 if staff_night_ok[e] != "×":
@@ -304,20 +318,18 @@ if uploaded_file:
                     model.AddAbsEquality(abs_diff_ot, diff_ot)
                     penalties.append(abs_diff_ot * 5)
 
-            # 🌟 NEW: 残業の「回数」を公平化するロジック（これで日勤が少ない人の割合が高くなります）
-            total_ot_req = sum(overtime_req_list)
-            if total_ot_req > 0:
-                ot_counts = []
+            # 🌟 修正: 真の「残業割合」公平化ロジック
+            # （同じ日勤数の人同士は残業数が同じになり、日勤が多い人は残業回数が増える自然なバランス）
+            total_ot_req = sum(overtime_req_list); total_day_req = sum(day_req_list) 
+            if total_ot_req > 0 and total_day_req > 0:
                 for e in range(num_staff):
                     if staff_overtime_ok[e] != "×":
-                        ot_counts.append(sum(shifts[(e, d, 'A残')] for d in range(num_days)))
-                if ot_counts:
-                    max_ot = model.NewIntVar(0, num_days, '')
-                    min_ot = model.NewIntVar(0, num_days, '')
-                    model.AddMaxEquality(max_ot, ot_counts)
-                    model.AddMinEquality(min_ot, ot_counts)
-                    # 残業回数の最大と最小の差を減らす
-                    penalties.append((max_ot - min_ot) * 100)
+                        act_d = sum(shifts[(e, d, 'A')] + shifts[(e, d, 'A残')] for d in range(num_days))
+                        act_o = sum(shifts[(e, d, 'A残')] for d in range(num_days))
+                        diff = model.NewIntVar(-10000, 10000, ''); abs_diff = model.NewIntVar(0, 10000, '')
+                        model.Add(diff == (act_o * total_day_req) - (act_d * total_ot_req))
+                        model.AddAbsEquality(abs_diff, diff)
+                        penalties.append(abs_diff)
 
             for e in range(num_staff):
                 ot_bias = random.randint(-2, 2); night_bias = random.randint(-2, 2); off_bias = random.randint(-2, 2)
@@ -407,7 +419,6 @@ if uploaded_file:
                         
                     df_res = pd.DataFrame(data)
 
-                    # 🌟 削除要望のあった列（日曜D、日曜E、残業割合）を消し、スッキリさせました
                     df_res['日勤(A/P)回数'] = df_res[cols].apply(lambda x: x.str.contains('A|P|Ｐ', na=False) & ~x.str.contains('残', na=False)).sum(axis=1)
                     df_res['残業(A残)回数'] = (df_res[cols] == 'A残').sum(axis=1)
                     df_res['夜勤(D)回数'] = (df_res[cols] == 'D').sum(axis=1)
@@ -428,7 +439,6 @@ if uploaded_file:
                     def highlight_warnings(df):
                         styles = pd.DataFrame('', index=df.index, columns=df.columns)
                         
-                        # 画面上での土日祝の色付け
                         for d, col_name in enumerate(cols):
                             if "土" in col_name: styles.iloc[:, d+1] = 'background-color: #E6F2FF;'
                             elif "日" in col_name or "祝" in col_name: styles.iloc[:, d+1] = 'background-color: #FFE6E6;'
@@ -468,7 +478,6 @@ if uploaded_file:
 
                     st.dataframe(df_fin.style.apply(highlight_warnings, axis=None))
                     
-                    # 🌟 エクセル出力時にも色付けを復活！
                     output = io.BytesIO()
                     with pd.ExcelWriter(output, engine='openpyxl') as writer:
                         df_fin.to_excel(writer, index=False, sheet_name='完成シフト')
@@ -482,14 +491,12 @@ if uploaded_file:
                         fill_n3 = PatternFill(start_color="FFD580", end_color="FFD580", fill_type="solid")
                         fill_n3_consec = PatternFill(start_color="E6E6FA", end_color="E6E6FA", fill_type="solid")
 
-                        # 土日祝の色
                         for c_idx, col_name in enumerate(cols):
                             if "土" in col_name:
                                 for r_idx in range(1, len(df_fin) + 2): worksheet.cell(row=r_idx, column=c_idx+2).fill = fill_sat
                             elif "日" in col_name or "祝" in col_name:
                                 for r_idx in range(1, len(df_fin) + 2): worksheet.cell(row=r_idx, column=c_idx+2).fill = fill_sun
 
-                        # 人数過不足の警告
                         row_a_idx = len(staff_names) + 2
                         for d, col_name in enumerate(cols):
                             actual_a = df_fin.loc[len(staff_names), col_name]
@@ -497,7 +504,6 @@ if uploaded_file:
                                 if actual_a < day_req_list[d]: worksheet.cell(row=row_a_idx, column=d+2).fill = fill_short
                                 elif actual_a > day_req_list[d]: worksheet.cell(row=row_a_idx, column=d+2).fill = fill_over
 
-                        # 連勤の警告
                         for e in range(num_staff):
                             for d in range(num_days):
                                 def is_d_work(day_idx):
