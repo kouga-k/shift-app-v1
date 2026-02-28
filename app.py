@@ -7,8 +7,8 @@ import datetime
 import random
 
 st.set_page_config(page_title="自動シフト作成アプリ", layout="wide")
-st.title("🤝 AIシフト作成 Co-Pilot (フェーズ24：ランダム多様化＆完全版)")
-st.write("残業や公休の配置にランダムな揺らぎを与え、全く違う3パターンを提案します！")
+st.title("🤝 AIシフト作成 Co-Pilot (フェーズ25：夜勤3連続の警告色追加)")
+st.write("夜勤3連続を妥協した場合、該当箇所を紫色でハイライトして警告します！")
 
 if 'needs_compromise' not in st.session_state:
     st.session_state.needs_compromise = False
@@ -240,6 +240,7 @@ if uploaded_file:
 
             for e in range(num_staff):
                 for d in range(num_days - 3): model.Add(shifts[(e, d, '公')] + shifts[(e, d+1, '公')] + shifts[(e, d+2, '公')] + shifts[(e, d+3, '公')] <= 3)
+
                 for d in range(num_days - 2):
                     is_3_off = model.NewBoolVar('')
                     model.Add(shifts[(e, d, '公')] + shifts[(e, d+1, '公')] + shifts[(e, d+2, '公')] == 3).OnlyEnforceIf(is_3_off)
@@ -261,8 +262,10 @@ if uploaded_file:
             for e in range(num_staff):
                 target_lvl = staff_comp_lvl[e]
                 w_base = 10 ** target_lvl if target_lvl > 0 else 0
+                
                 for d in range(num_days - 3):
                     def work(day): return shifts[(e, day, 'A')] + shifts[(e, day, 'A残')]
+                        
                     if allow_4_days and target_lvl > 0:
                         if d < num_days - 4: model.Add(work(d) + work(d+1) + work(d+2) + work(d+3) + work(d+4) <= 4)
                         p_var = model.NewBoolVar('')
@@ -315,20 +318,14 @@ if uploaded_file:
                         model.AddAbsEquality(abs_diff, diff)
                         penalties.append(abs_diff)
 
-            # 🌟 NEW: パターンを劇的に変化させるランダムな揺らぎ（スパイス）
             for e in range(num_staff):
                 ot_bias = random.randint(-2, 2)
                 night_bias = random.randint(-2, 2)
                 off_bias = random.randint(-2, 2)
-                
-                if staff_overtime_ok[e] != "×":
-                    penalties.append(sum(shifts[(e, d, 'A残')] for d in range(num_days)) * ot_bias)
-                if staff_night_ok[e] != "×":
-                    penalties.append(sum(shifts[(e, d, 'D')] for d in range(num_days)) * night_bias)
+                if staff_overtime_ok[e] != "×": penalties.append(sum(shifts[(e, d, 'A残')] for d in range(num_days)) * ot_bias)
+                if staff_night_ok[e] != "×": penalties.append(sum(shifts[(e, d, 'D')] for d in range(num_days)) * night_bias)
                 penalties.append(sum(shifts[(e, d, '公')] for d in range(num_days)) * off_bias)
-                
-                for d in range(num_days):
-                    penalties.append(shifts[(e, d, 'A')] * random.randint(-1, 1))
+                for d in range(num_days): penalties.append(shifts[(e, d, 'A')] * random.randint(-1, 1))
             
             if penalties: model.Minimize(sum(penalties))
 
@@ -451,18 +448,27 @@ if uploaded_file:
                                     v = str(df.loc[e, cols[day_idx]])
                                     return v == 'A' or v == 'A残' or 'P' in v or 'Ｐ' in v
 
+                                # 4連勤（黄）
                                 if is_day_work(d) and is_day_work(d+1) and is_day_work(d+2) and is_day_work(d+3):
                                     styles.loc[e, cols[d]] = 'background-color: #FFFF99;'
                                     styles.loc[e, cols[d+1]] = 'background-color: #FFFF99;'
                                     styles.loc[e, cols[d+2]] = 'background-color: #FFFF99;'
                                     styles.loc[e, cols[d+3]] = 'background-color: #FFFF99;'
 
+                                # 夜勤前3日勤（オレンジ）
                                 if d + 3 < num_days:
                                     if is_day_work(d) and is_day_work(d+1) and is_day_work(d+2) and str(df.loc[e, cols[d+3]]) == 'D':
                                         styles.loc[e, cols[d]] = 'background-color: #FFD580;'
                                         styles.loc[e, cols[d+1]] = 'background-color: #FFD580;'
                                         styles.loc[e, cols[d+2]] = 'background-color: #FFD580;'
                                         styles.loc[e, cols[d+3]] = 'background-color: #FFD580;'
+                                        
+                                # 🌟 NEW: 夜勤セット3連続の警告（紫色）
+                                if d + 8 < num_days:
+                                    if str(df.loc[e, cols[d]]) == 'D' and str(df.loc[e, cols[d+3]]) == 'D' and str(df.loc[e, cols[d+6]]) == 'D':
+                                        for i in range(9):
+                                            styles.loc[e, cols[d+i]] = 'background-color: #E6E6FA;' # 薄い紫
+                                            
                         return styles
 
                     st.dataframe(df_fin.style.apply(highlight_warnings, axis=None))
