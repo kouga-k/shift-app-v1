@@ -7,10 +7,12 @@ import datetime
 from openpyxl.styles import PatternFill
 
 st.set_page_config(page_title="自動シフト作成アプリ", layout="wide")
-st.title("🌟 AI自動シフト作成アプリ (フェーズ9：カレンダー自動色付け版)")
-st.write("土日祝の全自動色付けと、パート(P〇)の対応、AI相談機能を搭載した完成形です！")
+st.title("🌟 AI自動シフト作成アプリ (フェーズ10：厳格モード＆警告ハイライト版)")
+st.write("AIの勝手な妥協を禁止し、イレギュラーが発生した箇所を「色」で警告します！")
 
 # --- 妥協案のセッション管理 ---
+if 'allow_day_minus_1' not in st.session_state:
+    st.session_state.allow_day_minus_1 = False
 if 'allow_4_days_work' not in st.session_state:
     st.session_state.allow_4_days_work = False
 if 'allow_night_before_3_days' not in st.session_state:
@@ -18,15 +20,13 @@ if 'allow_night_before_3_days' not in st.session_state:
 if 'allow_sub_only' not in st.session_state:
     st.session_state.allow_sub_only = False
 
-# 🗓️ 作成する年月の選択（祝日判定用）
 st.write("---")
-st.write("🗓️ **作成するシフトの「年」と「月」を選んでください（祝日の自動判定に使います）**")
+st.write("🗓️ **作成するシフトの「年」と「月」を選んでください**")
 today = datetime.date.today()
 col_y, col_m = st.columns(2)
 with col_y:
     target_year = st.selectbox("作成年", [today.year, today.year + 1], index=0)
 with col_m:
-    # 現在の月の「次の月」をデフォルトにする
     next_month = today.month + 1 if today.month < 12 else 1
     target_month = st.selectbox("作成月", list(range(1, 13)), index=next_month - 1)
 st.write("---")
@@ -58,7 +58,6 @@ if uploaded_file:
                 val = df_staff["夜勤上限"].iloc[i]
                 staff_night_limits.append(int(val) if pd.notna(val) else 10)
         
-        staff_overtime_ok = df_staff["残業可否"].fillna("〇").tolist()
         staff_sun_d = []
         staff_sun_e = []
         for i in range(num_staff):
@@ -89,21 +88,21 @@ if uploaded_file:
         absolute_req_list = get_str_row("絶対確保", "")
         night_req_list = get_req_row("夜勤人数", 2)
 
-        st.success(f"✅ データの読み込み完了！祝日判定用のカレンダーを準備しました！")
+        st.success(f"✅ データの読み込み完了！AIの勝手な妥協を禁止し、厳格モードで準備しました。")
         
-        # 💬 AIからのご相談エリア
-        with st.expander("📩 AI店長への特別許可（シフトが組めない時だけ開いてください）", expanded=True):
-            st.warning("👩‍💼 **AI店長からのご相談:**\n\n『申し訳ありません、現在の人数と希望休ではどうしてもシフトが組めません💦 もしよろしければ、今回だけ以下のルールのどれかを特別に許可していただけませんか？』")
-            col1, col2, col3 = st.columns(3)
+        # 💬 AIからのご相談エリア（日勤人数の妥協を追加）
+        with st.expander("📩 AI店長への特別許可（※エラーで組めない時だけチェックを入れてください）", expanded=True):
+            st.warning("👩‍💼 **AI店長からのご相談:**\n\n『基本はルールを100%死守して時間をかけて考えます！でも、どうしても無理な場合だけ、以下の妥協を許可してください💦』")
+            col1, col2 = st.columns(2)
             with col1:
-                st.session_state.allow_4_days_work = st.checkbox("🙏 誰かが「最大4連勤」になることを許可する", value=st.session_state.allow_4_days_work)
-            with col2:
-                st.session_state.allow_night_before_3_days = st.checkbox("🙏 誰かの夜勤直前が「3日勤」になることを許可する", value=st.session_state.allow_night_before_3_days)
-            with col3:
+                st.session_state.allow_day_minus_1 = st.checkbox("🙏 日勤人数の「マイナス1」を許可する（※絶対確保の日は除く）", value=st.session_state.allow_day_minus_1)
                 st.session_state.allow_sub_only = st.checkbox("🙏 リーダー不在時、「サブ1名＋他」の配置を許可する", value=st.session_state.allow_sub_only)
+            with col2:
+                st.session_state.allow_4_days_work = st.checkbox("🙏 誰かが「最大4連勤」になることを許可する（※該当箇所は黄色で警告します）", value=st.session_state.allow_4_days_work)
+                st.session_state.allow_night_before_3_days = st.checkbox("🙏 誰かの夜勤直前が「3日勤」になることを許可する（※該当箇所はオレンジ色で警告します）", value=st.session_state.allow_night_before_3_days)
 
-        if st.button("シフトを自動作成する！（自動色付け版🔥）"):
-            with st.spinner('AI店長がパズルを解き、カレンダーに色を塗っています...（最大45秒）'):
+        if st.button("時間をかけて完璧なシフトを考える（最大3分🔥）"):
+            with st.spinner('AI店長がたっぷり時間を使って、完璧なパズルを計算しています...（最大3分かかります。お待ちください🙏）'):
                 
                 model = cp_model.CpModel()
                 shift_types = ['A', 'D', 'E', '公']
@@ -124,6 +123,7 @@ if uploaded_file:
                             model.Add(shifts[(e, d, 'D')] == 0)
                             model.Add(shifts[(e, d, 'E')] == 0)
 
+                # 前月履歴の引き継ぎ
                 for e, staff_name in enumerate(staff_names):
                     target_row = df_history[df_history.iloc[:, 0] == staff_name]
                     if not target_row.empty:
@@ -135,6 +135,7 @@ if uploaded_file:
                         elif last_month_last_day == "E":
                             model.Add(shifts[(e, 0, '公')] == 1)
 
+                # 夜勤セットのロック
                 for e in range(num_staff):
                     if staff_night_ok[e] != "×":
                         target_row = df_history[df_history.iloc[:, 0] == staff_names[e]]
@@ -147,6 +148,7 @@ if uploaded_file:
                             if d + 1 < num_days:
                                 model.AddImplication(shifts[(e, d, 'E')], shifts[(e, d+1, '公')])
 
+                # 人数の確保
                 for d in range(num_days):
                     model.Add(sum(shifts[(e, d, 'D')] for e in range(num_staff)) == night_req_list[d])
                     
@@ -154,11 +156,19 @@ if uploaded_file:
                         shifts[(e, d, 'A')] for e in range(num_staff) if "新人" not in str(staff_roles[e])
                     )
                     
+                    # 🌟 勝手な妥協を禁止！
                     if absolute_req_list[d] == "〇":
+                        # 絶対確保日は、妥協チェックが入っていても絶対に死守
                         model.Add(actual_day_staff >= day_req_list[d])
                     else:
-                        model.Add(actual_day_staff >= day_req_list[d] - 1)
+                        if st.session_state.allow_day_minus_1:
+                            # 人間が許可した時だけ、マイナス1を許容
+                            model.Add(actual_day_staff >= day_req_list[d] - 1)
+                        else:
+                            # デフォルトは絶対に基本人数を死守
+                            model.Add(actual_day_staff >= day_req_list[d])
 
+                # 役割配置
                 for d in range(num_days):
                     leadership_score = sum(
                         (2 if "主任" in str(staff_roles[e]) or "リーダー" in str(staff_roles[e]) else 1 if "サブ" in str(staff_roles[e]) else 0) * shifts[(e, d, 'A')]
@@ -169,6 +179,7 @@ if uploaded_file:
                     else:
                         model.Add(leadership_score >= 2)
 
+                # 希望休
                 for e, staff_name in enumerate(staff_names):
                     target_row = df_history[df_history.iloc[:, 0] == staff_name]
                     if not target_row.empty:
@@ -179,11 +190,13 @@ if uploaded_file:
                                 if cell_value == "公":
                                     model.Add(shifts[(e, d, '公')] == 1)
 
+                # 回数ノルマ
                 for e in range(num_staff):
                     model.Add(sum(shifts[(e, d, '公')] for d in range(num_days)) == int(staff_off_days[e]))
                     if staff_night_ok[e] != "×":
                         model.Add(sum(shifts[(e, d, 'D')] for d in range(num_days)) <= int(staff_night_limits[e]))
 
+                # 連勤・連休制限
                 for e in range(num_staff):
                     for d in range(num_days - 3):
                         model.Add(shifts[(e, d, '公')] + shifts[(e, d+1, '公')] + shifts[(e, d+2, '公')] + shifts[(e, d+3, '公')] <= 3)
@@ -198,24 +211,22 @@ if uploaded_file:
                             model.AddImplication(shifts[(e, d+3, 'D')], shifts[(e, d, 'A')] + shifts[(e, d+1, 'A')] + shifts[(e, d+2, 'A')] <= 2)
 
                 solver = cp_model.CpSolver()
-                solver.parameters.max_time_in_seconds = 45.0
+                # 🌟 時間をたっぷり使う（最大3分＝180秒）
+                solver.parameters.max_time_in_seconds = 180.0
                 status = solver.Solve(model)
                 
                 if status == cp_model.OPTIMAL or status == cp_model.FEASIBLE:
                     st.success("✨シフトが完成しました！✨")
                     
-                    # 🌟 曜日と祝日の判定（列名を 1(月) のように結合）
                     new_date_columns = []
                     for d_val, w_val in zip(date_columns, weekdays):
                         try:
-                            # 祝日判定
                             dt = datetime.date(target_year, target_month, int(d_val))
                             if jpholiday.is_holiday(dt):
                                 new_date_columns.append(f"{d_val}({w_val}・祝)")
                             else:
                                 new_date_columns.append(f"{d_val}({w_val})")
                         except ValueError:
-                            # 31日が存在しない月などの安全対策
                             new_date_columns.append(f"{d_val}({w_val})")
                     
                     result_data = []
@@ -225,7 +236,6 @@ if uploaded_file:
                         for d in range(num_days):
                             for s in shift_types:
                                 if solver.Value(shifts[(e, d, s)]) == 1:
-                                    # P〇の処理
                                     if s == 'A' and str(staff_part_shifts[e]).strip() not in ["", "nan"]:
                                         row[new_date_columns[d]] = str(staff_part_shifts[e]).strip()
                                     else:
@@ -234,7 +244,6 @@ if uploaded_file:
                         
                     result_df = pd.DataFrame(result_data)
 
-                    # 集計処理
                     result_df['日勤(A・P)回数'] = result_df[new_date_columns].apply(lambda x: x.str.contains('A|P|Ｐ', na=False)).sum(axis=1)
                     result_df['夜勤(D)回数'] = (result_df[new_date_columns] == 'D').sum(axis=1)
                     result_df['公休回数'] = (result_df[new_date_columns] == '公').sum(axis=1)
@@ -279,49 +288,105 @@ if uploaded_file:
                     summary_df = pd.DataFrame([summary_A, summary_D, summary_Off])
                     final_df = pd.concat([result_df, summary_df], ignore_index=True)
 
-                    # 🌟 画面上での色付け設定（Streamlit）
-                    def highlight_cols(s):
-                        if s.name is None:
-                            return [''] * len(s)
-                        col_name = str(s.name)
-                        if "祝" in col_name or "(日)" in col_name:
-                            return ['background-color: #FFE6E6'] * len(s) # 薄い赤
-                        elif "(土)" in col_name:
-                            return ['background-color: #E6F2FF'] * len(s) # 薄い青
-                        else:
-                            return [''] * len(s)
+                    # 🌟 警告のハイライト関数（色付け）
+                    def highlight_warnings(df):
+                        # 出力用と同じサイズの空のDataFrame（スタイル用）を作る
+                        styles = pd.DataFrame('', index=df.index, columns=df.columns)
+                        
+                        # 1. 毎日の集計行のチェック（日勤人数が設定値を下回っていたら赤）
+                        for d, col_name in enumerate(new_date_columns):
+                            actual_a = df.loc[len(staff_names), col_name] # 集計行のAの数
+                            target_a = day_req_list[d]
+                            if actual_a < target_a:
+                                styles.loc[len(staff_names), col_name] = 'background-color: #FFCCCC; color: red; font-weight: bold;' # 赤色
 
-                    st.dataframe(final_df.style.apply(highlight_cols, axis=0))
+                        # 2. 該当スタッフの4連勤、夜勤前3連勤のチェック
+                        for e in range(num_staff):
+                            for d in range(num_days):
+                                col_name = new_date_columns[d]
+                                val = str(df.loc[e, col_name])
+                                
+                                # 出勤扱い（A, P, D, E）か判定する関数
+                                def is_work(day_idx):
+                                    if day_idx >= num_days: return False
+                                    v = str(df.loc[e, new_date_columns[day_idx]])
+                                    return v == 'A' or 'P' in v or v == 'D' or v == 'E'
+
+                                # 4連勤の検出（黄色）
+                                if is_work(d) and is_work(d+1) and is_work(d+2) and is_work(d+3):
+                                    styles.loc[e, new_date_columns[d]] = 'background-color: #FFFF99;'
+                                    styles.loc[e, new_date_columns[d+1]] = 'background-color: #FFFF99;'
+                                    styles.loc[e, new_date_columns[d+2]] = 'background-color: #FFFF99;'
+                                    styles.loc[e, new_date_columns[d+3]] = 'background-color: #FFFF99;'
+
+                                # 夜勤前3連勤（A, A, A, D）の検出（オレンジ）
+                                if d + 3 < num_days:
+                                    v1 = str(df.loc[e, new_date_columns[d]])
+                                    v2 = str(df.loc[e, new_date_columns[d+1]])
+                                    v3 = str(df.loc[e, new_date_columns[d+2]])
+                                    v4 = str(df.loc[e, new_date_columns[d+3]])
+                                    if (v1=='A' or 'P' in v1) and (v2=='A' or 'P' in v2) and (v3=='A' or 'P' in v3) and v4=='D':
+                                        styles.loc[e, new_date_columns[d]] = 'background-color: #FFD580;'
+                                        styles.loc[e, new_date_columns[d+1]] = 'background-color: #FFD580;'
+                                        styles.loc[e, new_date_columns[d+2]] = 'background-color: #FFD580;'
+                                        styles.loc[e, new_date_columns[d+3]] = 'background-color: #FFD580;'
+
+                        return styles
+
+                    st.dataframe(final_df.style.apply(highlight_warnings, axis=None))
                     
-                    # 🌟 エクセル出力での色付け設定（openpyxl）
+                    # 🌟 エクセル出力での色付け設定
                     output = io.BytesIO()
                     with pd.ExcelWriter(output, engine='openpyxl') as writer:
                         final_df.to_excel(writer, index=False, sheet_name='完成シフト')
                         worksheet = writer.sheets['完成シフト']
                         
-                        fill_sat = PatternFill(start_color="DDEBF7", end_color="DDEBF7", fill_type="solid") # 薄い青
-                        fill_sun_hol = PatternFill(start_color="FCE4D6", end_color="FCE4D6", fill_type="solid") # 薄い赤
+                        fill_red = PatternFill(start_color="FFCCCC", end_color="FFCCCC", fill_type="solid")
+                        fill_yellow = PatternFill(start_color="FFFF99", end_color="FFFF99", fill_type="solid")
+                        fill_orange = PatternFill(start_color="FFD580", end_color="FFD580", fill_type="solid")
                         
-                        # 列名を見て、土日祝ならその列全体に色を塗る
-                        for col_idx, col_name in enumerate(final_df.columns, 1):
-                            col_str = str(col_name)
-                            if "祝" in col_str or "(日)" in col_str:
-                                for row in range(1, len(final_df) + 2):
-                                    worksheet.cell(row=row, column=col_idx).fill = fill_sun_hol
-                            elif "(土)" in col_str:
-                                for row in range(1, len(final_df) + 2):
-                                    worksheet.cell(row=row, column=col_idx).fill = fill_sat
-                                    
+                        # DataFrameのスタイルを適用するロジック（簡易版）
+                        # ① 日勤人数不足（赤）
+                        for d, col_name in enumerate(new_date_columns):
+                            actual_a = final_df.loc[len(staff_names), col_name]
+                            if actual_a < day_req_list[d]:
+                                worksheet.cell(row=len(staff_names)+2, column=d+4).fill = fill_red # ヘッダー分などズレ考慮
+
+                        # ② 連勤チェック（黄・オレンジ）
+                        for e in range(num_staff):
+                            for d in range(num_days):
+                                def is_work(day_idx):
+                                    if day_idx >= num_days: return False
+                                    v = str(final_df.loc[e, new_date_columns[day_idx]])
+                                    return v == 'A' or 'P' in v or v == 'D' or v == 'E'
+
+                                if is_work(d) and is_work(d+1) and is_work(d+2) and is_work(d+3):
+                                    worksheet.cell(row=e+2, column=d+4).fill = fill_yellow
+                                    worksheet.cell(row=e+2, column=d+5).fill = fill_yellow
+                                    worksheet.cell(row=e+2, column=d+6).fill = fill_yellow
+                                    worksheet.cell(row=e+2, column=d+7).fill = fill_yellow
+
+                                if d + 3 < num_days:
+                                    v1 = str(final_df.loc[e, new_date_columns[d]])
+                                    v2 = str(final_df.loc[e, new_date_columns[d+1]])
+                                    v3 = str(final_df.loc[e, new_date_columns[d+2]])
+                                    v4 = str(final_df.loc[e, new_date_columns[d+3]])
+                                    if (v1=='A' or 'P' in v1) and (v2=='A' or 'P' in v2) and (v3=='A' or 'P' in v3) and v4=='D':
+                                        worksheet.cell(row=e+2, column=d+4).fill = fill_orange
+                                        worksheet.cell(row=e+2, column=d+5).fill = fill_orange
+                                        worksheet.cell(row=e+2, column=d+6).fill = fill_orange
+                                        worksheet.cell(row=e+2, column=d+7).fill = fill_orange
+                                        
                     processed_data = output.getvalue()
                     
                     st.download_button(
-                        label="📥 完成した究極のシフトをダウンロード（色付き）",
+                        label="📥 完成したシフトをダウンロード（警告色付き）",
                         data=processed_data,
-                        file_name="完成版_実務完全版_色付き.xlsx",
+                        file_name="完成版_厳格モード_警告付き.xlsx",
                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                     )
                 else:
-                    st.error("❌ 【AI店長より】\n申し訳ありません、どうしても今の条件ではシフトが破綻してしまいます😭\n上の「📩AI店長への特別許可」を開いて、どれか1つでも許可のチェックを入れてから再度お試しください！")
+                    st.error("❌ 【AI店長より】\n3分間フルに考えましたが、どうしてもルール違反なしではシフトが組めません😭\n上の「📩AI店長への特別許可」を開いて、妥協を許可してから再度ボタンを押してください！")
                     
     except Exception as e:
-        st.error(f"⚠️ エラーが発生しました: 部品（jpholiday）が入っていないか、エクセルの形式が間違っています。({e})")
+        st.error(f"⚠️ エラーが発生しました: エクセルの形式が間違っているか、空白の行があります。({e})")
