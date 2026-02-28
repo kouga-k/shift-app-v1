@@ -8,8 +8,8 @@ import random
 from openpyxl.styles import PatternFill
 
 st.set_page_config(page_title="自動シフト作成アプリ", layout="wide")
-st.title("🤝 AIシフト作成 Co-Pilot (フェーズ27：残業の逆比例ロジック)")
-st.write("「日勤が多い人ほど残業割合を低く（守る）」「日勤が少ない人ほど残業割合を高く」する思いやりロジックを搭載！")
+st.title("🤝 AIシフト作成 Co-Pilot (フェーズ27：定時2回確保版)")
+st.write("日勤に出るスタッフには必ず「定時(A)を最低2回」確保し、残業割合を公平化します！")
 
 if 'needs_compromise' not in st.session_state:
     st.session_state.needs_compromise = False
@@ -290,7 +290,7 @@ if uploaded_file:
                         model.Add(shifts[(e, d, 'A残')] + shifts[(e, d+1, 'A残')] == 2).OnlyEnforceIf(ot_var)
                         penalties.append(ot_var * 500)
 
-            # 定時(A)の絶対保護
+            # 🌟 定時(A)の絶対確保（最低2回）
             for e in range(num_staff):
                 if staff_overtime_ok[e] != "×":
                     total_day_work = sum(shifts[(e, d, 'A')] + shifts[(e, d, 'A残')] for d in range(num_days))
@@ -298,8 +298,9 @@ if uploaded_file:
                     model.Add(total_day_work > 0).OnlyEnforceIf(b_has_work)
                     model.Add(total_day_work == 0).OnlyEnforceIf(b_has_work.Not())
                     
+                    # 日勤に1回でも入るなら、必ず「定時(A)」を最低2回は確保する！
                     total_a_normal = sum(shifts[(e, d, 'A')] for d in range(num_days))
-                    model.Add(total_a_normal >= 1).OnlyEnforceIf(b_has_work)
+                    model.Add(total_a_normal >= 2).OnlyEnforceIf(b_has_work)
 
             mid_day = num_days // 2
             for e in range(num_staff):
@@ -315,18 +316,14 @@ if uploaded_file:
                     model.AddAbsEquality(abs_diff_ot, diff_ot)
                     penalties.append(abs_diff_ot * 5)
 
-            # 🌟 NEW: 真の「残業逆比例」ロジック（日勤が多い人ほど残業割合を低くする）
+            # 残業割合公平化
             ot_burden_scores = []
             for e in range(num_staff):
                 if staff_overtime_ok[e] != "×":
-                    # その人の「日勤回数」と「残業回数」を足し合わせる（＝総労働負荷）
-                    total_work_score = sum(shifts[(e, d, 'A')] + (shifts[(e, d, 'A残')] * 2) for d in range(num_days)) # 残業は負担が大きいので2倍でカウント
+                    total_work_score = sum(shifts[(e, d, 'A')] + (shifts[(e, d, 'A残')] * 2) for d in range(num_days)) 
                     ot_burden_scores.append(total_work_score)
             
             if ot_burden_scores:
-                # 全員の「総労働負荷」が同じくらいになるようにAIに調整させる
-                # ➔ 結果的に「日勤が多い人（すでに負荷が高い人）」には残業が振られにくくなり、
-                # ➔ 「日勤が少ない人（負荷が低い人）」に優先的に残業が振られるようになる！
                 max_burden = model.NewIntVar(0, 100, '')
                 min_burden = model.NewIntVar(0, 100, '')
                 model.AddMaxEquality(max_burden, ot_burden_scores)
@@ -343,7 +340,7 @@ if uploaded_file:
             if penalties: model.Minimize(sum(penalties))
 
             solver = cp_model.CpSolver()
-            solver.parameters.max_time_in_seconds = 30.0 
+            solver.parameters.max_time_in_seconds = 45.0 
             solver.parameters.random_seed = random_seed
             status = solver.Solve(model)
             
@@ -423,14 +420,13 @@ if uploaded_file:
 
                     df_res['日勤(A/P)回数'] = df_res[cols].apply(lambda x: x.str.contains('A|P|Ｐ', na=False) & ~x.str.contains('残', na=False)).sum(axis=1)
                     df_res['残業(A残)回数'] = (df_res[cols] == 'A残').sum(axis=1)
-                    df_res['残業割合(%)'] = df_res.apply(lambda r: f"{(r['残業(A残)回数']/r['日勤(A/P)回数'])*100:.1f}%" if r['日勤(A/P)回数']>0 else "0.0%", axis=1)
                     df_res['夜勤(D)回数'] = (df_res[cols] == 'D').sum(axis=1)
                     df_res['公休回数'] = (df_res[cols] == '公').sum(axis=1)
 
                     sum_A = {"スタッフ名": "【日勤(A/P) 合計人数】"}
                     sum_Az = {"スタッフ名": "【残業(A残) 合計人数】"}
                     
-                    for c in ['日勤(A/P)回数', '残業(A残)回数', '残業割合(%)', '夜勤(D)回数', '公休回数']:
+                    for c in ['日勤(A/P)回数', '残業(A残)回数', '夜勤(D)回数', '公休回数']:
                         sum_A[c] = ""; sum_Az[c] = ""
 
                     for d, c in enumerate(cols):
