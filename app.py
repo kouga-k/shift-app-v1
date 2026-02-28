@@ -5,11 +5,11 @@ import io
 import jpholiday
 import datetime
 import random
-from openpyxl.styles import PatternFill
+from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
 
 st.set_page_config(page_title="自動シフト作成アプリ", layout="wide")
-st.title("🤝 AIシフト作成 Co-Pilot (フェーズ29：公休デフォ9日・完成版)")
-st.write("定時確保数(K列可)の読み込みと、公休数のデフォルト「9日」設定を反映しました。")
+st.title("🤝 AIシフト作成 Co-Pilot")
+st.write("「定時確保」や「残業の逆比例公平化」を搭載した、実務完全対応のシフト作成システムです。")
 
 if 'needs_compromise' not in st.session_state:
     st.session_state.needs_compromise = False
@@ -42,19 +42,11 @@ if uploaded_file:
             return res
 
         staff_roles = get_staff_col("役割", "一般")
-        
-        # 🌟 変更：公休数のデフォルトを「9」に設定
         staff_off_days = get_staff_col("公休数", 9, is_int=True)
-        
-        # 空白は「〇」として扱う
         staff_night_ok = get_staff_col("夜勤可否", "〇")
         staff_overtime_ok = get_staff_col("残業可否", "〇")
-        
         staff_part_shifts = get_staff_col("パート", "")
-        
         staff_night_limits = [0 if ok == "×" else int(v) if pd.notna(v) else 10 for ok, v in zip(staff_night_ok, get_staff_col("夜勤上限", 10, is_int=True))]
-
-        # 定時確保数（K列などどこにあっても「定時確保数」という列名で探します。空白なら2回）
         staff_min_normal_a = get_staff_col("定時確保数", 2, is_int=True)
 
         staff_comp_lvl = []
@@ -62,7 +54,6 @@ if uploaded_file:
             val = ""
             if "妥協優先度" in df_staff.columns and pd.notna(df_staff["妥協優先度"].iloc[i]): val = str(df_staff["妥協優先度"].iloc[i]).strip()
             elif "連勤妥協OK" in df_staff.columns and pd.notna(df_staff["連勤妥協OK"].iloc[i]): val = str(df_staff["連勤妥協OK"].iloc[i]).strip()
-            
             if val in ["〇", "1", "1.0"]: staff_comp_lvl.append(1)
             elif val in ["2", "2.0"]: staff_comp_lvl.append(2)
             elif val in ["3", "3.0"]: staff_comp_lvl.append(3)
@@ -87,7 +78,6 @@ if uploaded_file:
         night_req_list = get_req_col("夜勤人数", 2)
         overtime_req_list = get_req_col("残業人数", 0)
         absolute_req_list = get_req_col("絶対確保", "", is_int=False)
-
         weekdays = [str(df_req.iloc[0, d+1]).strip() if (d+1) < len(df_req.columns) and pd.notna(df_req.iloc[0, d+1]) else "" for d in range(num_days)]
 
         st.success("✅ データの読み込み完了！まずは妥協なしの「理想のシフト」を作れるかテストします。")
@@ -99,12 +89,8 @@ if uploaded_file:
             
             random.seed(random_seed)
             for e in range(num_staff):
-                for d in range(num_days):
-                    model.AddHint(shifts[(e, d, 'A')], random.choice([0, 1]))
-
-            for e in range(num_staff):
-                for d in range(num_days):
-                    model.AddExactlyOne(shifts[(e, d, s)] for s in types)
+                for d in range(num_days): model.AddHint(shifts[(e, d, 'A')], random.choice([0, 1]))
+                for d in range(num_days): model.AddExactlyOne(shifts[(e, d, s)] for s in types)
                 if staff_night_ok[e] == "×":
                     for d in range(num_days):
                         model.Add(shifts[(e, d, 'D')] == 0); model.Add(shifts[(e, d, 'E')] == 0)
@@ -118,8 +104,7 @@ if uploaded_file:
                     if last_day == "D":
                         model.Add(shifts[(e, 0, 'E')] == 1)
                         if num_days > 1: model.Add(shifts[(e, 1, '公')] == 1)
-                    elif last_day == "E":
-                        model.Add(shifts[(e, 0, '公')] == 1)
+                    elif last_day == "E": model.Add(shifts[(e, 0, '公')] == 1)
 
             for e in range(num_staff):
                 if staff_night_ok[e] != "×":
@@ -179,63 +164,47 @@ if uploaded_file:
 
                 if is_abs:
                     model.Add(act_day >= req)
-                    over_var = model.NewIntVar(0, 100, '')
-                    diff = model.NewIntVar(-100, 100, '')
-                    model.Add(diff == act_day - req)
-                    model.AddMaxEquality(over_var, [0, diff])
+                    over_var = model.NewIntVar(0, 100, ''); diff = model.NewIntVar(-100, 100, '')
+                    model.Add(diff == act_day - req); model.AddMaxEquality(over_var, [0, diff])
                     penalties.append(over_var * 1) 
                 elif is_sun:
                     model.Add(act_day <= req)
                     if not allow_minus_1: model.Add(act_day == req)
                     else:
-                        model.Add(act_day >= req - 1)
-                        m_var = model.NewBoolVar('')
-                        model.Add(act_day == req - 1).OnlyEnforceIf(m_var)
-                        model.Add(act_day == req).OnlyEnforceIf(m_var.Not())
+                        model.Add(act_day >= req - 1); m_var = model.NewBoolVar('')
+                        model.Add(act_day == req - 1).OnlyEnforceIf(m_var); model.Add(act_day == req).OnlyEnforceIf(m_var.Not())
                         penalties.append(m_var * 1000)
                 else:
                     if not allow_minus_1: model.Add(act_day >= req)
                     else:
-                        model.Add(act_day >= req - 1)
-                        m_var = model.NewBoolVar('')
-                        model.Add(act_day == req - 1).OnlyEnforceIf(m_var)
-                        model.Add(act_day != req - 1).OnlyEnforceIf(m_var.Not())
+                        model.Add(act_day >= req - 1); m_var = model.NewBoolVar('')
+                        model.Add(act_day == req - 1).OnlyEnforceIf(m_var); model.Add(act_day != req - 1).OnlyEnforceIf(m_var.Not())
                         penalties.append(m_var * 1000)
-                    
-                    over_var = model.NewIntVar(0, 100, '')
-                    diff = model.NewIntVar(-100, 100, '')
-                    model.Add(diff == act_day - req)
-                    model.AddMaxEquality(over_var, [0, diff])
+                    over_var = model.NewIntVar(0, 100, ''); diff = model.NewIntVar(-100, 100, '')
+                    model.Add(diff == act_day - req); model.AddMaxEquality(over_var, [0, diff])
                     penalties.append(over_var * 100)
 
                 l_score = sum((2 if "主任" in str(staff_roles[e]) or "リーダー" in str(staff_roles[e]) else 1 if "サブ" in str(staff_roles[e]) else 0) * (shifts[(e, d, 'A')] + shifts[(e, d, 'A残')]) for e in range(num_staff))
                 if not allow_sub_only: model.Add(l_score >= 2)
                 else:
-                    model.Add(l_score >= 1)
-                    sub_var = model.NewBoolVar('')
-                    model.Add(l_score == 1).OnlyEnforceIf(sub_var)
-                    penalties.append(sub_var * 1000)
+                    model.Add(l_score >= 1); sub_var = model.NewBoolVar('')
+                    model.Add(l_score == 1).OnlyEnforceIf(sub_var); penalties.append(sub_var * 1000)
 
             for e, staff_name in enumerate(staff_names):
                 tr = df_history[df_history.iloc[:, 0] == staff_name]
                 if not tr.empty:
                     for d in range(num_days):
                         col_idx = 6 + d
-                        if col_idx < tr.shape[1]:
-                            if str(tr.iloc[0, col_idx]).strip() == "公": model.Add(shifts[(e, d, '公')] == 1)
+                        if col_idx < tr.shape[1] and str(tr.iloc[0, col_idx]).strip() == "公": model.Add(shifts[(e, d, '公')] == 1)
 
             for e in range(num_staff):
                 model.Add(sum(shifts[(e, d, '公')] for d in range(num_days)) == int(staff_off_days[e]))
-                if staff_night_ok[e] != "×":
-                    model.Add(sum(shifts[(e, d, 'D')] for d in range(num_days)) <= int(staff_night_limits[e]))
+                if staff_night_ok[e] != "×": model.Add(sum(shifts[(e, d, 'D')] for d in range(num_days)) <= int(staff_night_limits[e]))
 
             limit_groups = {}
             for e in range(num_staff):
-                if staff_night_ok[e] != "×":
-                    limit = int(staff_night_limits[e])
-                    if limit > 0:
-                        if limit not in limit_groups: limit_groups[limit] = []
-                        limit_groups[limit].append(e)
+                if staff_night_ok[e] != "×" and int(staff_night_limits[e]) > 0:
+                    limit_groups.setdefault(int(staff_night_limits[e]), []).append(e)
             for limit, members in limit_groups.items():
                 if len(members) >= 2:
                     actual_nights = [sum(shifts[(m, d, 'D')] for d in range(num_days)) for m in members]
@@ -245,7 +214,6 @@ if uploaded_file:
 
             for e in range(num_staff):
                 for d in range(num_days - 3): model.Add(shifts[(e, d, '公')] + shifts[(e, d+1, '公')] + shifts[(e, d+2, '公')] + shifts[(e, d+3, '公')] <= 3)
-
                 for d in range(num_days - 2):
                     is_3_off = model.NewBoolVar('')
                     model.Add(shifts[(e, d, '公')] + shifts[(e, d+1, '公')] + shifts[(e, d+2, '公')] == 3).OnlyEnforceIf(is_3_off)
@@ -258,19 +226,15 @@ if uploaded_file:
                     model.Add(shifts[(e, d, '公')] + shifts[(e, d+1, '公')] == 2).OnlyEnforceIf(is_2_off)
                     model.Add(shifts[(e, d, '公')] + shifts[(e, d+1, '公')] <= 1).OnlyEnforceIf(is_2_off.Not())
                     is_2_offs.append(is_2_off)
-                
                 has_any_2_off = model.NewBoolVar('')
-                model.Add(sum(is_2_offs) >= 1).OnlyEnforceIf(has_any_2_off) 
-                model.Add(sum(is_2_offs) == 0).OnlyEnforceIf(has_any_2_off.Not())
+                model.Add(sum(is_2_offs) >= 1).OnlyEnforceIf(has_any_2_off); model.Add(sum(is_2_offs) == 0).OnlyEnforceIf(has_any_2_off.Not())
                 penalties.append(has_any_2_off.Not() * 300) 
 
             for e in range(num_staff):
                 target_lvl = staff_comp_lvl[e]
                 w_base = 10 ** target_lvl if target_lvl > 0 else 0
-                
                 for d in range(num_days - 3):
                     def work(day): return shifts[(e, day, 'A')] + shifts[(e, day, 'A残')]
-                        
                     if allow_4_days and target_lvl > 0:
                         if d < num_days - 4: model.Add(work(d) + work(d+1) + work(d+2) + work(d+3) + work(d+4) <= 4)
                         p_var = model.NewBoolVar('')
@@ -298,31 +262,14 @@ if uploaded_file:
                         model.Add(shifts[(e, d, 'A残')] + shifts[(e, d+1, 'A残')] == 2).OnlyEnforceIf(ot_var)
                         penalties.append(ot_var * 500)
 
-            # 定時(A)の個別確保ルールの適用
             for e in range(num_staff):
                 if staff_overtime_ok[e] != "×":
                     total_day_work = sum(shifts[(e, d, 'A')] + shifts[(e, d, 'A残')] for d in range(num_days))
                     b_has_work = model.NewBoolVar('')
-                    model.Add(total_day_work > 0).OnlyEnforceIf(b_has_work)
-                    model.Add(total_day_work == 0).OnlyEnforceIf(b_has_work.Not())
-                    
+                    model.Add(total_day_work > 0).OnlyEnforceIf(b_has_work); model.Add(total_day_work == 0).OnlyEnforceIf(b_has_work.Not())
                     min_a = int(staff_min_normal_a[e])
                     total_a_normal = sum(shifts[(e, d, 'A')] for d in range(num_days))
                     model.Add(total_a_normal >= min_a).OnlyEnforceIf(b_has_work)
-
-            mid_day = num_days // 2
-            for e in range(num_staff):
-                if staff_night_ok[e] != "×":
-                    diff_d = model.NewIntVar(-100, 100, ''); abs_diff_d = model.NewIntVar(0, 100, '')
-                    model.Add(diff_d == sum(shifts[(e, d, 'D')] for d in range(mid_day)) - sum(shifts[(e, d, 'D')] for d in range(mid_day, num_days)))
-                    model.AddAbsEquality(abs_diff_d, diff_d)
-                    penalties.append(abs_diff_d * 5)
-                
-                if staff_overtime_ok[e] != "×":
-                    diff_ot = model.NewIntVar(-100, 100, ''); abs_diff_ot = model.NewIntVar(0, 100, '')
-                    model.Add(diff_ot == sum(shifts[(e, d, 'A残')] for d in range(mid_day)) - sum(shifts[(e, d, 'A残')] for d in range(mid_day, num_days)))
-                    model.AddAbsEquality(abs_diff_ot, diff_ot)
-                    penalties.append(abs_diff_ot * 5)
 
             ot_burden_scores = []
             for e in range(num_staff):
@@ -331,11 +278,9 @@ if uploaded_file:
                     ot_burden_scores.append(total_work_score)
             
             if ot_burden_scores:
-                max_burden = model.NewIntVar(0, 100, '')
-                min_burden = model.NewIntVar(0, 100, '')
-                model.AddMaxEquality(max_burden, ot_burden_scores)
-                model.AddMinEquality(min_burden, ot_burden_scores)
-                penalties.append((max_burden - min_burden) * 50)
+                max_b = model.NewIntVar(0, 100, ''); min_b = model.NewIntVar(0, 100, '')
+                model.AddMaxEquality(max_b, ot_burden_scores); model.AddMinEquality(min_b, ot_burden_scores)
+                penalties.append((max_b - min_b) * 50)
 
             for e in range(num_staff):
                 ot_bias = random.randint(-2, 2); night_bias = random.randint(-2, 2); off_bias = random.randint(-2, 2)
@@ -347,7 +292,7 @@ if uploaded_file:
             if penalties: model.Minimize(sum(penalties))
 
             solver = cp_model.CpSolver()
-            solver.parameters.max_time_in_seconds = 30.0 
+            solver.parameters.max_time_in_seconds = 45.0 
             solver.parameters.random_seed = random_seed
             status = solver.Solve(model)
             
@@ -367,7 +312,7 @@ if uploaded_file:
                         st.session_state.needs_compromise = True
                         st.rerun()
         else:
-            st.error("⚠️ 【AI店長からのご報告】\n申し訳ありません。現在の人数と希望休では、すべてのルールを完璧に守ってシフトを組むことは不可能でした...")
+            st.error("⚠️ 【AIからのご報告】申し訳ありません。現在の条件では、ルールを完璧に守ってシフトを組むことは不可能でした...")
             st.warning("💡 以下のいずれかの「妥協案」を許可して、再計算を指示してください。")
             
             with st.container():
@@ -384,10 +329,8 @@ if uploaded_file:
                 
                 st.markdown("**■ その他の例外ルール**")
                 col3, col4 = st.columns(2)
-                with col3:
-                    allow_night_consec_3 = st.checkbox("やむを得ない「月またぎ含む、夜勤セット3連続」を許可する")
-                with col4:
-                    allow_ot_consec = st.checkbox("やむを得ない「残業(A残)の2日連続」を許可する")
+                with col3: allow_night_consec_3 = st.checkbox("やむを得ない「月またぎ含む、夜勤セット3連続」を許可する")
+                with col4: allow_ot_consec = st.checkbox("やむを得ない「残業(A残)の2日連続」を許可する")
 
             if st.button("🔄 【STEP 3】チェックした妥協案を許可して、3パターンのシフトを作る！"):
                 with st.spinner('許可された妥協案をもとに、AIが再計算しています...'):
@@ -444,7 +387,6 @@ if uploaded_file:
 
                     def highlight_warnings(df):
                         styles = pd.DataFrame('', index=df.index, columns=df.columns)
-                        
                         for d, col_name in enumerate(cols):
                             if "土" in col_name: styles.iloc[:, d+1] = 'background-color: #E6F2FF;'
                             elif "日" in col_name or "祝" in col_name: styles.iloc[:, d+1] = 'background-color: #FFE6E6;'
@@ -478,16 +420,21 @@ if uploaded_file:
                                         
                                 if d + 8 < num_days:
                                     if str(df.loc[e, cols[d]]) == 'D' and str(df.loc[e, cols[d+3]]) == 'D' and str(df.loc[e, cols[d+6]]) == 'D':
-                                        for k in range(9):
-                                            styles.loc[e, cols[d+k]] = 'background-color: #E6E6FA; font-weight: bold; color: black;'
+                                        for k in range(9): styles.loc[e, cols[d+k]] = 'background-color: #E6E6FA; font-weight: bold; color: black;'
                         return styles
 
                     st.dataframe(df_fin.style.apply(highlight_warnings, axis=None))
                     
+                    # 🌟 エクセル出力時のレイアウト変更（メイリオ、中央揃え、細罫線）
                     output = io.BytesIO()
                     with pd.ExcelWriter(output, engine='openpyxl') as writer:
                         df_fin.to_excel(writer, index=False, sheet_name='完成シフト')
                         worksheet = writer.sheets['完成シフト']
+                        
+                        font_meiryo = Font(name='Meiryo')
+                        border_thin = Border(left=Side(style='thin'), right=Side(style='thin'), top=Side(style='thin'), bottom=Side(style='thin'))
+                        align_center = Alignment(horizontal='center', vertical='center')
+                        align_left = Alignment(horizontal='left', vertical='center')
                         
                         fill_sat = PatternFill(start_color="E6F2FF", end_color="E6F2FF", fill_type="solid")
                         fill_sun = PatternFill(start_color="FFE6E6", end_color="FFE6E6", fill_type="solid")
@@ -496,6 +443,16 @@ if uploaded_file:
                         fill_4days = PatternFill(start_color="FFFF99", end_color="FFFF99", fill_type="solid")
                         fill_n3 = PatternFill(start_color="FFD580", end_color="FFD580", fill_type="solid")
                         fill_n3_consec = PatternFill(start_color="E6E6FA", end_color="E6E6FA", fill_type="solid")
+
+                        # 全セルへのフォント・罫線・配置の適用
+                        for row in worksheet.iter_rows(min_row=1, max_row=worksheet.max_row, min_col=1, max_col=worksheet.max_column):
+                            for cell in row:
+                                cell.font = font_meiryo
+                                cell.border = border_thin
+                                if cell.column == 1: # A列（スタッフ名）
+                                    cell.alignment = align_left
+                                else: # B列以降
+                                    cell.alignment = align_center
 
                         for c_idx, col_name in enumerate(cols):
                             if "土" in col_name:
@@ -531,9 +488,9 @@ if uploaded_file:
                     processed_data = output.getvalue()
                     
                     st.download_button(
-                        label=f"📥 【パターン {i+1}】 をエクセルでダウンロード（色付き）",
+                        label=f"📥 【パターン {i+1}】 をエクセルでダウンロード（レイアウト完成版）",
                         data=processed_data,
-                        file_name=f"完成版_色付きシフト_{i+1}.xlsx",
+                        file_name=f"完成版_レイアウト適用シフト_{i+1}.xlsx",
                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                         key=f"dl_btn_{i}"
                     )
