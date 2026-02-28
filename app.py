@@ -5,11 +5,11 @@ import io
 import jpholiday
 import datetime
 from openpyxl.styles import PatternFill
-import random # ランダムにパターンを変える魔法
+import random
 
 st.set_page_config(page_title="自動シフト作成アプリ", layout="wide")
-st.title("🌟 AI自動シフト作成アプリ (フェーズ12：公平化＆3パターン提案)")
-st.write("残業の偏りをなくし、全く違う「3パターンの完成シフト」を同時にご提案します！")
+st.title("🌟 AI自動シフト作成アプリ (フェーズ13：残業割合の公平化)")
+st.write("「日勤回数に対する残業の割合」が全員平等になるよう、3パターンのシフトを提案します！")
 
 # --- 妥協案のセッション管理 ---
 if 'allow_day_minus_1' not in st.session_state:
@@ -36,7 +36,6 @@ uploaded_file = st.file_uploader("エクセルファイル (.xlsx) を選択", t
 
 if uploaded_file:
     try:
-        # 1. データの読み込み
         df_staff = pd.read_excel(uploaded_file, sheet_name="スタッフ設定")
         df_history = pd.read_excel(uploaded_file, sheet_name="希望休・前月履歴")
         df_req = pd.read_excel(uploaded_file, sheet_name="日別設定")
@@ -92,7 +91,7 @@ if uploaded_file:
         overtime_req_list = get_req_row("残業人数", 0)
         night_req_list = get_req_row("夜勤人数", 2)
 
-        st.success(f"✅ データの読み込み完了！残業の公平化設定を準備しました。")
+        st.success(f"✅ データの読み込み完了！")
         
         with st.expander("📩 AI店長への特別許可（※エラーで組めない時だけチェックを入れてください）", expanded=True):
             st.warning("👩‍💼 **AI店長からのご相談:**\n\n『どうしても無理な場合だけ、以下の妥協を許可してください💦』")
@@ -101,10 +100,9 @@ if uploaded_file:
                 st.session_state.allow_day_minus_1 = st.checkbox("🙏 日勤人数の「マイナス1」を許可する", value=st.session_state.allow_day_minus_1)
                 st.session_state.allow_sub_only = st.checkbox("🙏 リーダー不在時、「サブ1名＋他」を許可する", value=st.session_state.allow_sub_only)
             with col2:
-                st.session_state.allow_4_days_work = st.checkbox("🙏 誰かが「最大4連勤」になることを許可する（※黄色で警告します）", value=st.session_state.allow_4_days_work)
+                st.session_state.allow_4_days_work = st.checkbox("🙏 誰かが「最大4連勤」になることを許可する（※黄色で警告）", value=st.session_state.allow_4_days_work)
                 st.session_state.allow_consecutive_overtime = st.checkbox("🙏 やむを得ない「残業(A残)の2日連続」を許可する", value=st.session_state.allow_consecutive_overtime)
 
-        # 🌟 シフト作成エンジン（これを3回呼び出す）
         def solve_shift(random_seed):
             model = cp_model.CpModel()
             shift_types = ['A', 'A残', 'D', 'E', '公']
@@ -115,7 +113,6 @@ if uploaded_file:
                     for s in shift_types:
                         shifts[(e, d, s)] = model.NewBoolVar(f'shift_{e}_{d}_{s}')
                         
-            # ランダムに探索を始めるおまじない（これでパターンが変わる）
             model.AddHint(shifts[(0, 0, 'A')], random.choice([0, 1]))
 
             for e in range(num_staff):
@@ -217,29 +214,44 @@ if uploaded_file:
                     for d in range(num_days - 1):
                         model.Add(shifts[(e, d, 'A残')] + shifts[(e, d+1, 'A残')] <= 1)
 
-            # 🌟 NEW: A残の回数を平均化する（ペナルティ方式）
-            # 残業可能なスタッフの、1ヶ月の残業回数をカウントする変数を作る
-            overtime_counts = []
-            for e in range(num_staff):
-                if staff_overtime_ok[e] != "×":
-                    count_var = model.NewIntVar(0, num_days, f'ot_{e}')
-                    model.Add(count_var == sum(shifts[(e, d, 'A残')] for d in range(num_days)))
-                    overtime_counts.append(count_var)
+            # 🌟 究極の「残業割合」公平化ロジック
+            # 月間の総残業枠と総日勤枠（概算）を計算
+            total_ot_req = sum(overtime_req_list)
+            total_day_req = sum(day_req_list) # 基本値での概算
             
-            # もし残業可能な人が1人以上いれば、その中で「最大回数」と「最小回数」の差をなるべく小さくする
-            if overtime_counts:
-                max_ot = model.NewIntVar(0, num_days, 'max_ot')
-                min_ot = model.NewIntVar(0, num_days, 'min_ot')
-                model.AddMaxEquality(max_ot, overtime_counts)
-                model.AddMinEquality(min_ot, overtime_counts)
+            # 残業可能なスタッフ全員について、ペナルティ（理想からのズレ）を計算
+            penalties = []
+            if total_ot_req > 0 and total_day_req > 0:
+                for e in range(num_staff):
+                    if staff_overtime_ok[e] != "×":
+                        # この人の実際の日勤合計（A + A残）
+                        actual_days_worked = sum(shifts[(e, d, 'A')] + shifts[(e, d, 'A残')] for d in range(num_days))
+                        # この人の実際の残業合計（A残）
+                        actual_ot = sum(shifts[(e, d, 'A残')] for d in range(num_days))
+                        
+                        # 【掛け算のトリック】
+                        # 理想の残業数 = (実際の日勤数) × (総残業枠 / 総日勤枠)
+                        # つまり：実際の日勤数 × 総残業枠 ＝ 理想の残業数 × 総日勤枠
+                        # これを利用して、両辺の差（ズレ）をペナルティとする
+                        
+                        ideal_ot_scaled = actual_days_worked * total_ot_req
+                        actual_ot_scaled = actual_ot * total_day_req
+                        
+                        # ズレの絶対値を計算するための変数
+                        diff = model.NewIntVar(-10000, 10000, f'diff_{e}')
+                        abs_diff = model.NewIntVar(0, 10000, f'abs_diff_{e}')
+                        
+                        model.Add(diff == actual_ot_scaled - ideal_ot_scaled)
+                        model.AddAbsEquality(abs_diff, diff)
+                        penalties.append(abs_diff)
                 
-                # 「最大回数 - 最小回数」をペナルティとして、最小化しろ！と命令する
-                model.Minimize(max_ot - min_ot)
+                # ペナルティの合計を最小化しろ！と命令する
+                if penalties:
+                    model.Minimize(sum(penalties))
 
-            # --- 計算実行 ---
             solver = cp_model.CpSolver()
             solver.parameters.max_time_in_seconds = 60.0 # 1パターンにつき最大60秒
-            solver.parameters.random_seed = random_seed # ランダムシードでパターンを変える
+            solver.parameters.random_seed = random_seed
             status = solver.Solve(model)
             
             if status == cp_model.OPTIMAL or status == cp_model.FEASIBLE:
@@ -248,12 +260,10 @@ if uploaded_file:
                 return None, None
 
 
-        # 🌟 「3パターン作成ボタン」が押されたら
         if st.button("公平なシフトを【3パターン】作成する！（最大3分🔥）"):
             with st.spinner('AI店長が全く違う3つのシフトを同時に考えています...（最大3分かかります）'):
                 
                 results = []
-                # シード値を変えて3回解かせる
                 for seed in [1, 42, 99]:
                     solver, shifts = solve_shift(seed)
                     if solver:
@@ -264,7 +274,6 @@ if uploaded_file:
                 else:
                     st.success(f"✨シフトが完成しました！ {len(results)}パターンのご提案があります！✨")
                     
-                    # カレンダーの列名作り
                     new_date_columns = []
                     for d_val, w_val in zip(date_columns, weekdays):
                         try:
@@ -276,7 +285,6 @@ if uploaded_file:
                         except ValueError:
                             new_date_columns.append(f"{d_val}({w_val})")
 
-                    # 🌟 画面上にタブを作る
                     tab_names = [f"提案パターン {i+1}" for i in range(len(results))]
                     tabs = st.tabs(tab_names)
                     
@@ -297,8 +305,18 @@ if uploaded_file:
                                 
                             result_df = pd.DataFrame(result_data)
 
-                            result_df['日勤(A・P)回数'] = result_df[new_date_columns].apply(lambda x: x.str.contains('A|P|Ｐ', na=False) & ~x.str.contains('残', na=False)).sum(axis=1)
+                            # 🌟 集計：日勤の分母（AとA残とP）と、分子（A残）をそれぞれ出す
+                            result_df['日勤(A・P)回数'] = result_df[new_date_columns].apply(lambda x: x.str.contains('A|P|Ｐ', na=False)).sum(axis=1)
                             result_df['残業(A残)回数'] = (result_df[new_date_columns] == 'A残').sum(axis=1)
+                            
+                            # 🌟 残業の割合（％）を表示する列を追加
+                            def calc_ratio(row):
+                                if row['日勤(A・P)回数'] > 0:
+                                    return f"{(row['残業(A残)回数'] / row['日勤(A・P)回数']) * 100:.1f}%"
+                                return "0.0%"
+                            
+                            result_df['残業割合'] = result_df.apply(calc_ratio, axis=1)
+
                             result_df['夜勤(D)回数'] = (result_df[new_date_columns] == 'D').sum(axis=1)
                             result_df['公休回数'] = (result_df[new_date_columns] == '公').sum(axis=1)
                             
@@ -325,7 +343,7 @@ if uploaded_file:
                             summary_D = {"スタッフ名": "【夜勤(D) 合計】", "役割": "", "パート": ""}
                             summary_Off = {"スタッフ名": "【公休 合計】", "役割": "", "パート": ""}
                             
-                            for col in ['日勤(A・P)回数', '残業(A残)回数', '夜勤(D)回数', '公休回数', '日曜D回数(〇のみ)', '日曜E回数(〇のみ)']:
+                            for col in ['日勤(A・P)回数', '残業(A残)回数', '残業割合', '夜勤(D)回数', '公休回数', '日曜D回数(〇のみ)', '日曜E回数(〇のみ)']:
                                 summary_A[col] = ""
                                 summary_A_zan[col] = ""
                                 summary_D[col] = ""
@@ -395,9 +413,9 @@ if uploaded_file:
                             st.download_button(
                                 label=f"📥 【パターン {i+1}】 をエクセルでダウンロード",
                                 data=processed_data,
-                                file_name=f"完成版_パターン{i+1}.xlsx",
+                                file_name=f"完成版_残業割合公平化_パターン{i+1}.xlsx",
                                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                                key=f"dl_btn_{i}" # ボタンのIDを被らないようにする
+                                key=f"dl_btn_{i}"
                             )
                     
     except Exception as e:
