@@ -8,8 +8,8 @@ import random
 from openpyxl.styles import PatternFill
 
 st.set_page_config(page_title="自動シフト作成アプリ", layout="wide")
-st.title("🤝 AIシフト作成 Co-Pilot (フェーズ27：定時2回確保版)")
-st.write("日勤に出るスタッフには必ず「定時(A)を最低2回」確保し、残業割合を公平化します！")
+st.title("🤝 AIシフト作成 Co-Pilot (フェーズ29：公休デフォ9日・完成版)")
+st.write("定時確保数(K列可)の読み込みと、公休数のデフォルト「9日」設定を反映しました。")
 
 if 'needs_compromise' not in st.session_state:
     st.session_state.needs_compromise = False
@@ -42,12 +42,20 @@ if uploaded_file:
             return res
 
         staff_roles = get_staff_col("役割", "一般")
-        staff_off_days = get_staff_col("公休数", 8, is_int=True)
+        
+        # 🌟 変更：公休数のデフォルトを「9」に設定
+        staff_off_days = get_staff_col("公休数", 9, is_int=True)
+        
+        # 空白は「〇」として扱う
         staff_night_ok = get_staff_col("夜勤可否", "〇")
         staff_overtime_ok = get_staff_col("残業可否", "〇")
+        
         staff_part_shifts = get_staff_col("パート", "")
         
         staff_night_limits = [0 if ok == "×" else int(v) if pd.notna(v) else 10 for ok, v in zip(staff_night_ok, get_staff_col("夜勤上限", 10, is_int=True))]
+
+        # 定時確保数（K列などどこにあっても「定時確保数」という列名で探します。空白なら2回）
+        staff_min_normal_a = get_staff_col("定時確保数", 2, is_int=True)
 
         staff_comp_lvl = []
         for i in range(num_staff):
@@ -290,7 +298,7 @@ if uploaded_file:
                         model.Add(shifts[(e, d, 'A残')] + shifts[(e, d+1, 'A残')] == 2).OnlyEnforceIf(ot_var)
                         penalties.append(ot_var * 500)
 
-            # 🌟 定時(A)の絶対確保（最低2回）
+            # 定時(A)の個別確保ルールの適用
             for e in range(num_staff):
                 if staff_overtime_ok[e] != "×":
                     total_day_work = sum(shifts[(e, d, 'A')] + shifts[(e, d, 'A残')] for d in range(num_days))
@@ -298,9 +306,9 @@ if uploaded_file:
                     model.Add(total_day_work > 0).OnlyEnforceIf(b_has_work)
                     model.Add(total_day_work == 0).OnlyEnforceIf(b_has_work.Not())
                     
-                    # 日勤に1回でも入るなら、必ず「定時(A)」を最低2回は確保する！
+                    min_a = int(staff_min_normal_a[e])
                     total_a_normal = sum(shifts[(e, d, 'A')] for d in range(num_days))
-                    model.Add(total_a_normal >= 2).OnlyEnforceIf(b_has_work)
+                    model.Add(total_a_normal >= min_a).OnlyEnforceIf(b_has_work)
 
             mid_day = num_days // 2
             for e in range(num_staff):
@@ -316,7 +324,6 @@ if uploaded_file:
                     model.AddAbsEquality(abs_diff_ot, diff_ot)
                     penalties.append(abs_diff_ot * 5)
 
-            # 残業割合公平化
             ot_burden_scores = []
             for e in range(num_staff):
                 if staff_overtime_ok[e] != "×":
@@ -340,7 +347,7 @@ if uploaded_file:
             if penalties: model.Minimize(sum(penalties))
 
             solver = cp_model.CpSolver()
-            solver.parameters.max_time_in_seconds = 45.0 
+            solver.parameters.max_time_in_seconds = 30.0 
             solver.parameters.random_seed = random_seed
             status = solver.Solve(model)
             
