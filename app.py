@@ -7,12 +7,11 @@ import datetime
 import random
 
 st.set_page_config(page_title="自動シフト作成アプリ", layout="wide")
-st.title("🤝 AIシフト作成 Co-Pilot (フェーズ21：夜勤ループ禁止版)")
-st.write("「夜勤セットの間に日勤が入らない（D E 公 公 D）」というブラックループを完全に禁止しました！")
+st.title("🤝 AIシフト作成 Co-Pilot (フェーズ21：スタッフへの思いやり版)")
+st.write("「基本は2連休まで」「全員に月1回は2連休をプレゼントする」という優しいルールを追加しました！")
 
 # 状態管理
-if 'needs_compromise' not in st.session_state:
-    st.session_state.needs_compromise = False
+if 'needs_compromise' not in st.session_state: st.session_state.needs_compromise = False
 
 st.write("---")
 today = datetime.date.today()
@@ -38,8 +37,7 @@ if uploaded_file:
                 if col_name in df_staff.columns and pd.notna(df_staff[col_name].iloc[i]):
                     val = df_staff[col_name].iloc[i]
                     res.append(int(val) if is_int else str(val).strip())
-                else:
-                    res.append(default_val)
+                else: res.append(default_val)
             return res
 
         staff_roles = get_staff_col("役割", "一般")
@@ -85,7 +83,7 @@ if uploaded_file:
 
         weekdays = [str(df_req.iloc[0, d+1]).strip() if (d+1) < len(df_req.columns) and pd.notna(df_req.iloc[0, d+1]) else "" for d in range(num_days)]
 
-        st.success("✅ データの読み込み完了！まずは妥協なしの「理想のシフト」を作れるかテストします。")
+        st.success("✅ データの読み込み完了！スタッフへの「思いやり」を込めて計算します。")
 
         def solve_shift(random_seed, allow_minus_1=False, allow_4_days=False, allow_night_3=False, allow_sub_only=False, allow_ot_consec=False, allow_night_consec_3=False):
             model = cp_model.CpModel()
@@ -102,7 +100,6 @@ if uploaded_file:
                 if staff_overtime_ok[e] == "×":
                     for d in range(num_days): model.Add(shifts[(e, d, 'A残')] == 0)
 
-            # 前月履歴
             for e, staff_name in enumerate(staff_names):
                 tr = df_history[df_history.iloc[:, 0] == staff_name]
                 if not tr.empty:
@@ -110,10 +107,8 @@ if uploaded_file:
                     if last_day == "D":
                         model.Add(shifts[(e, 0, 'E')] == 1)
                         if num_days > 1: model.Add(shifts[(e, 1, '公')] == 1)
-                    elif last_day == "E":
-                        model.Add(shifts[(e, 0, '公')] == 1)
+                    elif last_day == "E": model.Add(shifts[(e, 0, '公')] == 1)
 
-            # 夜勤セットの絶対ルール
             for e in range(num_staff):
                 if staff_night_ok[e] != "×":
                     tr = df_history[df_history.iloc[:, 0] == staff_names[e]]
@@ -126,45 +121,35 @@ if uploaded_file:
 
             penalties = []
             
-            # 🌟 NEW: 夜勤ループ（日勤なしで夜勤再突入）の完全禁止
+            # 夜勤ループと3連続防止
             for e in range(num_staff):
                 if staff_night_ok[e] != "×":
-                    # ① 当月内の禁止（E 公 公 D と E 公 公 公 D を禁止する。※E 公 D は2連続なのでOK）
-                    for d in range(num_days - 3):
-                        model.Add(shifts[(e, d, 'E')] + shifts[(e, d+1, '公')] + shifts[(e, d+2, '公')] + shifts[(e, d+3, 'D')] <= 3)
-                    for d in range(num_days - 4):
-                        model.Add(shifts[(e, d, 'E')] + shifts[(e, d+1, '公')] + shifts[(e, d+2, '公')] + shifts[(e, d+3, '公')] + shifts[(e, d+4, 'D')] <= 4)
+                    for d in range(num_days - 3): model.Add(shifts[(e, d, 'E')] + shifts[(e, d+1, '公')] + shifts[(e, d+2, '公')] + shifts[(e, d+3, 'D')] <= 3)
+                    for d in range(num_days - 4): model.Add(shifts[(e, d, 'E')] + shifts[(e, d+1, '公')] + shifts[(e, d+2, '公')] + shifts[(e, d+3, '公')] + shifts[(e, d+4, 'D')] <= 4)
                     
-                    # ② 月またぎの禁止
                     tr = df_history[df_history.iloc[:, 0] == staff_names[e]]
                     if not tr.empty and tr.shape[1] > 5:
-                        l_5 = [str(tr.iloc[0, i]).strip() for i in range(1, 6)] # 前月5日分の履歴
-                        # 前月最終日がEの場合（今月1日は公）
+                        l_5 = [str(tr.iloc[0, i]).strip() for i in range(1, 6)]
                         if l_5[4] == "E":
-                            if num_days > 2: model.Add(shifts[(e, 0, '公')] + shifts[(e, 1, '公')] + shifts[(e, 2, 'D')] <= 2) # E(先月) 公 公 D(今月3日)
+                            if num_days > 2: model.Add(shifts[(e, 0, '公')] + shifts[(e, 1, '公')] + shifts[(e, 2, 'D')] <= 2)
                             if num_days > 3: model.Add(shifts[(e, 0, '公')] + shifts[(e, 1, '公')] + shifts[(e, 2, '公')] + shifts[(e, 3, 'D')] <= 3)
-                        # 前月4日目がE、5日目が公の場合
                         if l_5[3] == "E" and l_5[4] == "公":
-                            if num_days > 1: model.Add(shifts[(e, 0, '公')] + shifts[(e, 1, 'D')] <= 1) # E 公(先月) 公 D(今月2日)
+                            if num_days > 1: model.Add(shifts[(e, 0, '公')] + shifts[(e, 1, 'D')] <= 1)
                             if num_days > 2: model.Add(shifts[(e, 0, '公')] + shifts[(e, 1, '公')] + shifts[(e, 2, 'D')] <= 2)
 
-            # 月またぎを考慮した「夜勤3連続の完全防止/緩和」
             for e, staff_name in enumerate(staff_names):
                 if staff_night_ok[e] != "×":
                     past_D = [0] * 5
                     tr = df_history[df_history.iloc[:, 0] == staff_name]
                     if not tr.empty:
                         for i in range(5):
-                            if (i+1) < tr.shape[1] and str(tr.iloc[0, i+1]).strip() == "D":
-                                past_D[i] = 1
+                            if (i+1) < tr.shape[1] and str(tr.iloc[0, i+1]).strip() == "D": past_D[i] = 1
                     
                     all_D = past_D + [shifts[(e, d, 'D')] for d in range(num_days)]
-                    
                     for i in range(len(all_D) - 6):
                         window = all_D[i : i+7]
                         if not allow_night_consec_3:
-                            if any(isinstance(x, cp_model.IntVar) for x in window):
-                                model.Add(sum(window) <= 2)
+                            if any(isinstance(x, cp_model.IntVar) for x in window): model.Add(sum(window) <= 2)
                         else:
                             if any(isinstance(x, cp_model.IntVar) for x in window):
                                 n3_var = model.NewBoolVar('')
@@ -172,7 +157,6 @@ if uploaded_file:
                                 model.Add(sum(window) <= 2).OnlyEnforceIf(n3_var.Not())
                                 penalties.append(n3_var * 5000)
 
-            # 日勤人数の誘導ロジック
             for d in range(num_days):
                 model.Add(sum(shifts[(e, d, 'D')] for e in range(num_staff)) == night_req_list[d])
                 model.Add(sum(shifts[(e, d, 'A残')] for e in range(num_staff)) == overtime_req_list[d])
@@ -189,7 +173,6 @@ if uploaded_file:
                     model.Add(diff == act_day - req)
                     model.AddMaxEquality(over_var, [0, diff])
                     penalties.append(over_var * 1) 
-
                 elif is_sun:
                     model.Add(act_day <= req)
                     if not allow_minus_1: model.Add(act_day == req)
@@ -242,22 +225,44 @@ if uploaded_file:
                     if limit > 0:
                         if limit not in limit_groups: limit_groups[limit] = []
                         limit_groups[limit].append(e)
-                        
             for limit, members in limit_groups.items():
                 if len(members) >= 2:
                     actual_nights = [sum(shifts[(m, d, 'D')] for d in range(num_days)) for m in members]
-                    max_n = model.NewIntVar(0, limit, '')
-                    min_n = model.NewIntVar(0, limit, '')
-                    model.AddMaxEquality(max_n, actual_nights)
-                    model.AddMinEquality(min_n, actual_nights)
+                    max_n = model.NewIntVar(0, limit, ''); min_n = model.NewIntVar(0, limit, '')
+                    model.AddMaxEquality(max_n, actual_nights); model.AddMinEquality(min_n, actual_nights)
                     model.Add(max_n - min_n <= 1)
+
+            # 🌟 思いやりの連休コントロール（2連休推奨・3連休防止）
+            for e in range(num_staff):
+                # 4連休以上は絶対に禁止（ハード制約）
+                for d in range(num_days - 3):
+                    model.Add(shifts[(e, d, '公')] + shifts[(e, d+1, '公')] + shifts[(e, d+2, '公')] + shifts[(e, d+3, '公')] <= 3)
+
+                # 3連休の防止（ソフト制約：希望休以外で作ってしまったら罰金）
+                for d in range(num_days - 2):
+                    is_3_off = model.NewBoolVar('')
+                    model.Add(shifts[(e, d, '公')] + shifts[(e, d+1, '公')] + shifts[(e, d+2, '公')] == 3).OnlyEnforceIf(is_3_off)
+                    model.Add(shifts[(e, d, '公')] + shifts[(e, d+1, '公')] + shifts[(e, d+2, '公')] <= 2).OnlyEnforceIf(is_3_off.Not())
+                    penalties.append(is_3_off * 500) # 希望休以外で3連休を作ったら罰金500
+
+                # 🌟 2連休のプレゼント（全員に最低1回は2連休を作ってあげる努力）
+                is_2_offs = []
+                for d in range(num_days - 1):
+                    is_2_off = model.NewBoolVar('')
+                    model.Add(shifts[(e, d, '公')] + shifts[(e, d+1, '公')] == 2).OnlyEnforceIf(is_2_off)
+                    model.Add(shifts[(e, d, '公')] + shifts[(e, d+1, '公')] <= 1).OnlyEnforceIf(is_2_off.Not())
+                    is_2_offs.append(is_2_off)
+                
+                has_any_2_off = model.NewBoolVar('')
+                model.Add(sum(is_2_offs) >= 1).OnlyEnforceIf(has_any_2_off) # 1回以上2連休があるか？
+                model.Add(sum(is_2_offs) == 0).OnlyEnforceIf(has_any_2_off.Not())
+                penalties.append(has_any_2_off.Not() * 300) # 2連休が1回もない人を作ってしまったら罰金300
 
             for e in range(num_staff):
                 target_lvl = staff_comp_lvl[e]
                 w_base = 10 ** target_lvl if target_lvl > 0 else 0
                 
                 for d in range(num_days - 3):
-                    model.Add(shifts[(e, d, '公')] + shifts[(e, d+1, '公')] + shifts[(e, d+2, '公')] + shifts[(e, d+3, '公')] <= 3)
                     def work(day): return shifts[(e, day, 'A')] + shifts[(e, day, 'A残')]
                         
                     if allow_4_days and target_lvl > 0:
@@ -281,8 +286,7 @@ if uploaded_file:
 
             for e in range(num_staff):
                 for d in range(num_days - 1):
-                    if not allow_ot_consec:
-                        model.Add(shifts[(e, d, 'A残')] + shifts[(e, d+1, 'A残')] <= 1)
+                    if not allow_ot_consec: model.Add(shifts[(e, d, 'A残')] + shifts[(e, d+1, 'A残')] <= 1)
                     else:
                         ot_var = model.NewBoolVar('')
                         model.Add(shifts[(e, d, 'A残')] + shifts[(e, d+1, 'A残')] == 2).OnlyEnforceIf(ot_var)
@@ -316,7 +320,7 @@ if uploaded_file:
             if penalties: model.Minimize(sum(penalties))
 
             solver = cp_model.CpSolver()
-            solver.parameters.max_time_in_seconds = 30.0
+            solver.parameters.max_time_in_seconds = 30.0 
             solver.parameters.random_seed = random_seed
             status = solver.Solve(model)
             
@@ -352,7 +356,7 @@ if uploaded_file:
                 st.markdown("**■ その他の例外ルール**")
                 col3, col4 = st.columns(2)
                 with col3:
-                    allow_night_consec_3 = st.checkbox("やむを得ない「夜勤セット3連続」を許可する")
+                    allow_night_consec_3 = st.checkbox("やむを得ない「月またぎ含む、夜勤セット3連続」を許可する")
                 with col4:
                     allow_ot_consec = st.checkbox("やむを得ない「残業(A残)の2日連続」を許可する")
 
@@ -363,8 +367,7 @@ if uploaded_file:
                         solver, shifts = solve_shift(seed, allow_minus_1, allow_4_days, allow_night_3, allow_sub_only, allow_ot_consec, allow_night_consec_3)
                         if solver: results.append((solver, shifts))
 
-                    if not results:
-                        st.error("😭 まだ条件が厳しすぎます！もう少しだけ他の妥協案も許可してもらえませんか？")
+                    if not results: st.error("😭 まだ条件が厳しすぎます！もう少しだけ他の妥協案も許可してもらえませんか？")
                     else:
                         st.success(f"✨ ありがとうございます！許可いただいた条件内で、{len(results)}パターンのシフトが完成しました！")
                         st.session_state.needs_compromise = False
