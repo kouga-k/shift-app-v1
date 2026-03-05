@@ -125,10 +125,11 @@ if uploaded_file:
                     # 前月最終日（列5）
                     if tr.shape[1] > 5:
                         prev_last_shift[e] = str(tr.iloc[0, 5]).strip()
-                    # 希望休（列6以降）
+                    # 希望休（G列=index6以降のみ対象。前月列との列名衝突を防ぐ）
+                    history_today_cols = list(tr.columns[6:])
                     for d in range(num_days):
                         col_name = date_columns[d]
-                        if col_name in tr.columns and str(tr.iloc[0][col_name]).strip() == "公":
+                        if col_name in history_today_cols and str(tr.iloc[0][col_name]).strip() == "公":
                             fixed_off[e] += 1
                             fixed_off_days_list[e].append(d)
                             fixed_off_per_day[d] += 1
@@ -402,9 +403,11 @@ if uploaded_file:
             for e, staff_name in enumerate(staff_names):
                 tr = df_history[df_history.iloc[:, 0] == staff_name]
                 if not tr.empty:
+                    # G列(index6)以降のみ対象。前月列との列名衝突を防ぐ
+                    history_today_cols = list(tr.columns[6:])
                     for d in range(num_days):
                         col_name = date_columns[d]
-                        if col_name in tr.columns and str(tr.iloc[0][col_name]).strip() == "公":
+                        if col_name in history_today_cols and str(tr.iloc[0][col_name]).strip() == "公":
                             model.Add(shifts[(e, d, '公')] == 1)
 
             for e in range(num_staff):
