@@ -291,7 +291,7 @@ if uploaded_file:
 
         st.success("✅ データの読み込み完了！まずは妥協なしの「理想のシフト」を作れるかテストします。")
 
-        def solve_shift(random_seed, allow_minus_1=False, allow_4_days=False, allow_night_3=False, allow_sub_only=False, allow_ot_consec=False, allow_night_consec_3=False):
+        def solve_shift(random_seed, allow_minus_1=False, allow_4_days=False, allow_night_3=False, allow_sub_only=False, allow_ot_consec=False, allow_night_consec_3=False, allow_sun_minus_1=False):
             model = cp_model.CpModel()
             types = ['A', 'A残', 'D', 'E', '公']
             shifts = {(e, d, s): model.NewBoolVar('') for e in range(num_staff) for d in range(num_days) for s in types}
@@ -376,13 +376,24 @@ if uploaded_file:
                     model.Add(act_day >= req)
                     over_var = model.NewIntVar(0, 100, ''); diff = model.NewIntVar(-100, 100, '')
                     model.Add(diff == act_day - req); model.AddMaxEquality(over_var, [0, diff])
-                    penalties.append(over_var * 1) 
+                    penalties.append(over_var * 1)
                 elif is_sun:
+                    # 日曜は設定人数固定。allow_sun_minus_1かつリーダー在勤の場合のみ-1を許可
                     model.Add(act_day <= req)
-                    if not allow_minus_1: model.Add(act_day == req)
+                    if not allow_sun_minus_1:
+                        model.Add(act_day == req)
                     else:
-                        model.Add(act_day >= req - 1); m_var = model.NewBoolVar('')
-                        model.Add(act_day == req - 1).OnlyEnforceIf(m_var); model.Add(act_day == req).OnlyEnforceIf(m_var.Not())
+                        # リーダー以上が1名以上いるか確認
+                        leader_present = sum((1 if "主任" in str(staff_roles[e]) or "リーダー" in str(staff_roles[e]) else 0) * (shifts[(e, d, 'A')] + shifts[(e, d, 'A残')]) for e in range(num_staff))
+                        has_leader = model.NewBoolVar('')
+                        model.Add(leader_present >= 1).OnlyEnforceIf(has_leader)
+                        model.Add(leader_present == 0).OnlyEnforceIf(has_leader.Not())
+                        # リーダーがいる場合のみ-1を許可
+                        model.Add(act_day >= req - 1).OnlyEnforceIf(has_leader)
+                        model.Add(act_day >= req).OnlyEnforceIf(has_leader.Not())
+                        m_var = model.NewBoolVar('')
+                        model.Add(act_day == req - 1).OnlyEnforceIf(m_var)
+                        model.Add(act_day != req - 1).OnlyEnforceIf(m_var.Not())
                         penalties.append(m_var * 1000)
                 else:
                     if not allow_minus_1: model.Add(act_day >= req)
@@ -512,115 +523,252 @@ if uploaded_file:
             if status == cp_model.OPTIMAL or status == cp_model.FEASIBLE: return solver, shifts
             else: return None, None
 
+        def solve_shift_fast(flags):
+            """妥協案の必要性チェック専用。時間を短縮して実現可否だけ判定する。"""
+            m1, f4, n3, sub, ot, nc3, sun1 = flags
+            # 45秒では遅いので、内部で短い制限を使う専用ソルバーを呼ぶ
+            # → solve_shiftのmax_time_in_secondsを短縮した版を直接組む
+            from ortools.sat.python import cp_model as _cp
+            _model = _cp.CpModel()
+            _types = ['A', 'A残', 'D', 'E', '公']
+            _shifts = {(e, d, s): _model.NewBoolVar('') for e in range(num_staff) for d in range(num_days) for s in _types}
+            # 基本制約のみ（ペナルティなし）でFEASIBLEチェック
+            for e in range(num_staff):
+                for d in range(num_days): _model.AddExactlyOne(_shifts[(e, d, s)] for s in _types)
+                if staff_night_ok[e] == "×":
+                    for d in range(num_days): _model.Add(_shifts[(e,d,'D')]==0); _model.Add(_shifts[(e,d,'E')]==0)
+                if staff_overtime_ok[e] == "×":
+                    for d in range(num_days): _model.Add(_shifts[(e,d,'A残')]==0)
+            for e, staff_name in enumerate(staff_names):
+                tr = df_history[df_history.iloc[:, 0] == staff_name]
+                if not tr.empty:
+                    last_day = str(tr.iloc[0, 5]).strip() if tr.shape[1] > 5 else ""
+                    if last_day == "D":
+                        _model.Add(_shifts[(e,0,'E')]==1)
+                        if num_days > 1: _model.Add(_shifts[(e,1,'公')]==1)
+                    elif last_day == "E": _model.Add(_shifts[(e,0,'公')]==1)
+            for e in range(num_staff):
+                if staff_night_ok[e] != "×":
+                    tr = df_history[df_history.iloc[:, 0] == staff_names[e]]
+                    if not tr.empty:
+                        l_day = str(tr.iloc[0, 5]).strip() if tr.shape[1] > 5 else ""
+                        if l_day != "D": _model.Add(_shifts[(e,0,'E')]==0)
+                    for d in range(num_days):
+                        if d > 0: _model.Add(_shifts[(e,d,'E')] == _shifts[(e,d-1,'D')])
+                        if d+1 < num_days: _model.AddImplication(_shifts[(e,d,'E')], _shifts[(e,d+1,'公')])
+            for e, staff_name in enumerate(staff_names):
+                tr = df_history[df_history.iloc[:, 0] == staff_name]
+                if not tr.empty:
+                    history_today_cols = list(tr.columns[6:])
+                    for d in range(num_days):
+                        col_name = date_columns[d]
+                        if col_name in history_today_cols and str(tr.iloc[0][col_name]).strip() == "公":
+                            _model.Add(_shifts[(e,d,'公')]==1)
+            for e in range(num_staff):
+                _model.Add(sum(_shifts[(e,d,'公')] for d in range(num_days)) == int(staff_off_days[e]))
+                if staff_night_ok[e] != "×": _model.Add(sum(_shifts[(e,d,'D')] for d in range(num_days)) <= int(staff_night_limits[e]))
+            for e in range(num_staff):
+                if staff_night_ok[e] != "×":
+                    past_D = [0]*5
+                    tr = df_history[df_history.iloc[:, 0] == staff_names[e]]
+                    if not tr.empty:
+                        for i in range(5):
+                            if (i+1) < tr.shape[1] and str(tr.iloc[0,i+1]).strip() == "D": past_D[i]=1
+                    all_D = past_D + [_shifts[(e,d,'D')] for d in range(num_days)]
+                    for i in range(len(all_D)-6):
+                        window = all_D[i:i+7]
+                        if not nc3 and any(isinstance(x, _cp.IntVar) for x in window): _model.Add(sum(window)<=2)
+            for d in range(num_days):
+                _model.Add(sum(_shifts[(e,d,'D')] for e in range(num_staff)) == night_req_list[d])
+                _model.Add(sum(_shifts[(e,d,'A残')] for e in range(num_staff)) == overtime_req_list[d])
+                act_day = sum((_shifts[(e,d,'A')]+_shifts[(e,d,'A残')]) for e in range(num_staff) if "新人" not in str(staff_roles[e]))
+                req = day_req_list[d]; is_sun = ('日' in weekdays[d]); is_abs = (absolute_req_list[d]=="〇")
+                if is_abs: _model.Add(act_day >= req)
+                elif is_sun:
+                    _model.Add(act_day <= req)
+                    if not sun1: _model.Add(act_day == req)
+                    else: _model.Add(act_day >= req-1)
+                else:
+                    if not m1: _model.Add(act_day >= req)
+                    else: _model.Add(act_day >= req-1)
+                l_score = sum((2 if "主任" in str(staff_roles[e]) or "リーダー" in str(staff_roles[e]) else 1 if "サブ" in str(staff_roles[e]) else 0)*(_shifts[(e,d,'A')]+_shifts[(e,d,'A残')]) for e in range(num_staff))
+                if not sub: _model.Add(l_score >= 2)
+                else: _model.Add(l_score >= 1)
+            for e in range(num_staff):
+                target_lvl = staff_comp_lvl[e]
+                for d in range(num_days-3):
+                    def _work(day, _e=e): return _shifts[(_e,day,'A')]+_shifts[(_e,day,'A残')]
+                    if not f4 or target_lvl == 0: _model.Add(_work(d)+_work(d+1)+_work(d+2)+_work(d+3)<=3)
+                    if not n3 or target_lvl == 0: _model.Add(_work(d)+_work(d+1)+_work(d+2)<=2).OnlyEnforceIf(_shifts[(e,d+3,'D')])
+            for e in range(num_staff):
+                for d in range(num_days-1):
+                    if not ot: _model.Add(_shifts[(e,d,'A残')]+_shifts[(e,d+1,'A残')]<=1)
+            for e in range(num_staff):
+                if staff_overtime_ok[e] != "×":
+                    total_day_work = sum(_shifts[(e,d,'A')]+_shifts[(e,d,'A残')] for d in range(num_days))
+                    b_has = _model.NewBoolVar('')
+                    _model.Add(total_day_work>0).OnlyEnforceIf(b_has); _model.Add(total_day_work==0).OnlyEnforceIf(b_has.Not())
+                    _model.Add(sum(_shifts[(e,d,'A')] for d in range(num_days)) >= int(staff_min_normal_a[e])).OnlyEnforceIf(b_has)
+            _solver = _cp.CpSolver()
+            _solver.parameters.max_time_in_seconds = 12.0
+            _solver.parameters.random_seed = 1
+            _status = _solver.Solve(_model)
+            return _status in (_cp.OPTIMAL, _cp.FEASIBLE)
+
+        # 妥協案の名称・引数位置の定義（順番固定）
+        # flags = (allow_minus_1, allow_4_days, allow_night_3, allow_sub_only, allow_ot_consec, allow_night_consec_3, allow_sun_minus_1)
+        COMPROMISE_LABELS = [
+            "日勤人数の「マイナス1」（平日・祝）",
+            "最大4連勤のお願い",
+            "夜勤前3日連続日勤のお願い",
+            "役割配置をサブ1名まで下げる",
+            "残業(A残)の2日連続",
+            "夜勤セット3連続（月またぎ含む）",
+            "日曜の出勤人数を設定より-1（リーダー在勤条件）",
+        ]
+        ALL_ON = (True, True, True, True, True, True, True)
+
+        if 'min_compromise_result' not in st.session_state:
+            st.session_state.min_compromise_result = None
+        if 'step3_failed' not in st.session_state:
+            st.session_state.step3_failed = False
+
         if not st.session_state.needs_compromise:
-            if st.button("▶️ 【STEP 1】まずは妥協なしで理想のシフトを計算する（3パターン）"):
-                with st.spinner('AIが「妥協なし」の完璧なシフトを3パターン模索中...'):
+            if st.button("▶️ 【STEP 1】まずは妥協なしで理想のシフトを計算する（5パターン）"):
+                with st.spinner('AIが「妥協なし」の完璧なシフトを5パターン模索中...'):
                     results = []
-                    for seed in [1, 42, 99]:
-                        solver, shifts = solve_shift(seed, False, False, False, False, False, False)
+                    for seed in [7, 42, 137, 512, 9999]:
+                        solver, shifts = solve_shift(seed, False, False, False, False, False, False, False)
                         if solver: results.append((solver, shifts))
-                        
-                    if results: st.success(f"🎉 なんと！妥協なしで完璧なシフトが {len(results)} パターン組めました！")
+
+                    if results:
+                        st.success(f"🎉 妥協なしで完璧なシフトが {len(results)} パターン組めました！")
                     else:
                         st.session_state.needs_compromise = True
+                        st.session_state.min_compromise_result = None
+                        st.session_state.step3_failed = False
                         st.rerun()
+
         else:
-            st.error("⚠️ 【AI店長からのご報告】\n申し訳ありません。現在の人数と希望休では、すべてのルールを完璧に守ってシフトを組むことは不可能でした...")
+            st.error("⚠️ 妥協なしではシフトを組めませんでした。妥協案を選んで再計算してください。")
 
-            # =====================================
-            # 🔍 詳細診断レポートを表示
-            # =====================================
+            # ── 診断レポート ──
             df_staff_diag, staff_warnings, df_day_diag, day_warnings, congestion_days, global_issues = diagnose_infeasibility()
-
-            with st.expander("🔍 **【原因診断レポート】なぜ組めなかったのか？詳細分析** ← クリックして確認", expanded=True):
-
-                # ── 全体チェック ──
+            with st.expander("🔍 **【原因診断レポート】** ← クリックして確認", expanded=False):
                 if global_issues:
                     st.markdown("### ⚠️ 全体チェックで検出された問題")
-                    for g in global_issues:
-                        st.error(g)
+                    for g in global_issues: st.error(g)
                     st.markdown("---")
-
-                # ── スタッフ別稼働余力テーブル ──
                 st.markdown("### 👥 ① スタッフ別 稼働余力チェック")
-                st.caption("🔴=明らかに不足　🟡=ギリギリ　🟢=問題なし　　※「実働可能日数」＝月日数－希望休－残り公休割当－前月チェーン拘束")
-
                 def color_staff_status(val):
-                    if "🔴" in str(val): return "background-color:#FFD0D0; font-weight:bold;"
+                    if "🔴" in str(val): return "background-color:#FFD0D0;font-weight:bold;"
                     if "🟡" in str(val): return "background-color:#FFF5CC;"
                     if "🟢" in str(val): return "background-color:#D8F5D8;"
                     return ""
                 st.dataframe(df_staff_diag.style.applymap(color_staff_status, subset=["判定"]), use_container_width=True)
-
                 if staff_warnings:
-                    st.markdown("**🔎 スタッフ別の問題点：**")
-                    for w in staff_warnings:
-                        st.warning(w)
-                else:
-                    st.success("スタッフ個別の稼働余力は問題ありません。")
+                    for w in staff_warnings: st.warning(w)
                 st.markdown("---")
-
-                # ── 日別過不足テーブル ──
                 st.markdown("### 📅 ② 日別 人員過不足チェック")
-                st.caption("🔴=不足確定　🟡=ギリギリ（希望休＋前月チェーン＋夜勤Dを除いた推定人数）　※残業人数は日勤に含めています")
-
                 def color_day_status(val):
-                    if "🔴" in str(val): return "background-color:#FFD0D0; font-weight:bold;"
+                    if "🔴" in str(val): return "background-color:#FFD0D0;font-weight:bold;"
                     if "🟡" in str(val): return "background-color:#FFF5CC;"
                     if "🟢" in str(val): return "background-color:#D8F5D8;"
                     return ""
                 st.dataframe(df_day_diag.style.applymap(color_day_status, subset=["判定"]), use_container_width=True)
-
                 if day_warnings:
-                    st.markdown("**🔎 人数不足が確定している日：**")
-                    for w in day_warnings:
-                        st.error(w)
-                else:
-                    st.success("日別の人数は一見問題ありません。（複合的な制約が原因の可能性があります）")
-                st.markdown("---")
-
-                # ── 希望休集中日 ──
+                    for w in day_warnings: st.error(w)
                 if congestion_days:
                     st.markdown("### 🗓️ ③ 希望休が集中している日")
-                    for c in congestion_days:
-                        st.warning(c)
-                    st.caption("💡 希望休が同じ日に集中すると、その日の日勤・夜勤が確保できなくなります。")
-                    st.markdown("---")
+                    for c in congestion_days: st.warning(c)
+                st.caption("※ この診断は推定値です。")
 
-                st.caption("*※ この診断は推定値です。夜勤チェーンの連鎖による中盤以降のブロックは含まれていません。妥協案の組み合わせで解決できる場合があります。*")
+            st.markdown("---")
 
-            st.warning("💡 以下のいずれかの「妥協案」を許可して、再計算を指示してください。")
-            
-            with st.container():
-                st.markdown("### 📝 妥協の提案リスト")
-                col1, col2 = st.columns(2)
-                with col1:
-                    st.markdown("**■ 人数と役割について**")
-                    allow_minus_1 = st.checkbox("日勤人数の「マイナス1」を許可する（絶対確保日以外）")
-                    allow_sub_only = st.checkbox("役割配置を「サブ1名＋他」まで下げることを許可する")
-                with col2:
-                    st.markdown("**■ 対象スタッフへの連勤お願い**")
-                    allow_4_days = st.checkbox("対象者への「最大4連勤」のお願いを許可する")
-                    allow_night_3 = st.checkbox("対象者への「夜勤前3日連続日勤」のお願いを許可する")
-                
-                st.markdown("**■ その他の例外ルール**")
-                col3, col4 = st.columns(2)
-                with col3:
-                    allow_night_consec_3 = st.checkbox("やむを得ない「月またぎ含む、夜勤セット3連続」を許可する")
-                with col4:
-                    allow_ot_consec = st.checkbox("やむを得ない「残業(A残)の2日連続」を許可する")
+            # ── STEP2：自動分析ボタン ──
+            if st.button("🔎 【STEP 2】どの妥協案が本当に必要か自動で調べる（約1分）"):
+                progress = st.progress(0, text="全妥協案ONで確認中...")
+                can_all = solve_shift_fast(ALL_ON)
+                if not can_all:
+                    st.error("😭 全妥協案をONにしても組めません。希望休や人数設定を見直してください。")
+                    st.session_state.min_compromise_result = None
+                else:
+                    necessary = [True] * 7
+                    for i in range(7):
+                        progress.progress((i+1)/8, text=f"「{COMPROMISE_LABELS[i]}」が不要か確認中... ({i+1}/7)")
+                        flags_test = list(ALL_ON)
+                        flags_test[i] = False
+                        if solve_shift_fast(tuple(flags_test)):
+                            necessary[i] = False
+                    progress.progress(1.0, text="分析完了！")
+                    st.session_state.min_compromise_result = necessary
 
-            if st.button("🔄 【STEP 3】チェックした妥協案を許可して、3パターンのシフトを作る！"):
-                with st.spinner('許可された妥協案をもとに、AIが再計算しています...'):
+            if st.session_state.min_compromise_result is not None:
+                necessary = st.session_state.min_compromise_result
+                needed   = [COMPROMISE_LABELS[i] for i in range(7) if necessary[i]]
+                unneeded = [COMPROMISE_LABELS[i] for i in range(7) if not necessary[i]]
+                col_n, col_u = st.columns(2)
+                with col_n:
+                    st.error("**🔴 必要な妥協案**")
+                    for n in (needed or ["なし"]): st.markdown(f"　{n}")
+                with col_u:
+                    st.success("**🟢 不要な妥協案**")
+                    for u in (unneeded or ["なし"]): st.markdown(f"　{u}")
+                st.markdown("---")
+
+            # ── 妥協案チェックボックス（日曜-1はここには出さない） ──
+            _r = st.session_state.min_compromise_result or [False]*7
+            st.markdown("### 📝 【STEP 2】妥協案を選んでください")
+            col1, col2 = st.columns(2)
+            with col1:
+                st.markdown("**■ 人数・役割**")
+                allow_minus_1  = st.checkbox("絶対確保日・日曜以外の日勤人数を-1にする", value=bool(_r[0]))
+                allow_sub_only = st.checkbox("役割配置を「サブ1名＋他」まで下げる", value=bool(_r[3]))
+            with col2:
+                st.markdown("**■ 連勤・夜勤**")
+                allow_4_days   = st.checkbox("対象者への「最大4連勤」を許可する", value=bool(_r[1]))
+                allow_night_3  = st.checkbox("対象者への「夜勤前3日連続日勤」を許可する", value=bool(_r[2]))
+            st.markdown("**■ その他**")
+            col3, col4 = st.columns(2)
+            with col3:
+                allow_night_consec_3 = st.checkbox("「夜勤セット3連続（月またぎ）」を許可する", value=bool(_r[5]))
+            with col4:
+                allow_ot_consec = st.checkbox("「残業A残の2日連続」を許可する", value=bool(_r[4]))
+
+            if st.button("🔄 【STEP 3】選んだ妥協案で5パターン作成"):
+                with st.spinner('計算中...'):
                     results = []
-                    for seed in [1, 42, 99]:
-                        solver, shifts = solve_shift(seed, allow_minus_1, allow_4_days, allow_night_3, allow_sub_only, allow_ot_consec, allow_night_consec_3)
+                    for seed in [7, 42, 137, 512, 9999]:
+                        solver, shifts = solve_shift(seed, allow_minus_1, allow_4_days, allow_night_3, allow_sub_only, allow_ot_consec, allow_night_consec_3, False)
                         if solver: results.append((solver, shifts))
-
-                    if not results: st.error("😭 まだ条件が厳しすぎます！もう少しだけ他の妥協案も許可してもらえませんか？")
-                    else:
-                        st.success(f"✨ ありがとうございます！許可いただいた条件内で、{len(results)}パターンのシフトが完成しました！")
+                    if results:
+                        st.success(f"✨ {len(results)}パターン完成！")
                         st.session_state.needs_compromise = False
+                        st.session_state.step3_failed = False
+                    else:
+                        st.session_state.step3_failed = True
+                        st.rerun()
+
+            # ── STEP3で失敗した場合のみ、日曜-1を追加オプションとして提示 ──
+            if st.session_state.step3_failed:
+                st.error("❌ 選んだ妥協案でもシフトが組めませんでした。")
+                st.markdown("---")
+                st.markdown("### 🌟 【STEP 4】日曜日の出勤人数も-1にしますか？")
+                st.warning("日曜は設定人数を固定しているため、さらに厳しい場合はここで許可できます。")
+                allow_sun_minus_1 = st.checkbox("日曜の出勤人数を設定より-1にする（リーダー在勤時のみ）", value=bool(_r[6]))
+
+                if st.button("🔄 【STEP 4】日曜-1も加えて5パターン作成"):
+                    with st.spinner('計算中...'):
+                        results = []
+                        for seed in [7, 42, 137, 512, 9999]:
+                            solver, shifts = solve_shift(seed, allow_minus_1, allow_4_days, allow_night_3, allow_sub_only, allow_ot_consec, allow_night_consec_3, allow_sun_minus_1)
+                            if solver: results.append((solver, shifts))
+                        if results:
+                            st.success(f"✨ {len(results)}パターン完成！")
+                            st.session_state.needs_compromise = False
+                            st.session_state.step3_failed = False
+                        else:
+                            st.error("😭 まだ組めません。希望休や人数設定を見直してください。")
 
         if 'results' in locals() and results:
             cols = []
@@ -630,6 +778,17 @@ if uploaded_file:
                     if jpholiday.is_holiday(dt): cols.append(f"{d_val}({w_val}・祝)")
                     else: cols.append(f"{d_val}({w_val})")
                 except ValueError: cols.append(f"{d_val}({w_val})")
+
+            # 希望休セル(e, d)の集合を事前に構築（黄色塗り用）
+            hope_off_set = set()
+            for e, staff_name in enumerate(staff_names):
+                tr = df_history[df_history.iloc[:, 0] == staff_name]
+                if not tr.empty:
+                    history_today_cols = list(tr.columns[6:])
+                    for d in range(num_days):
+                        col_name = date_columns[d]
+                        if col_name in history_today_cols and str(tr.iloc[0][col_name]).strip() == "公":
+                            hope_off_set.add((e, d))
 
             tabs = st.tabs([f"提案パターン {i+1}" for i in range(len(results))])
             for i, (solver, shifts) in enumerate(results):
@@ -651,17 +810,21 @@ if uploaded_file:
                     df_res['夜勤(D)回数'] = (df_res[cols] == 'D').sum(axis=1)
                     df_res['公休回数'] = (df_res[cols] == '公').sum(axis=1)
 
-                    sum_A = {"スタッフ名": "【日勤(A/P) 合計人数】"}
+                    sum_A  = {"スタッフ名": "【日勤(A/P) 合計人数】"}
                     sum_Az = {"スタッフ名": "【残業(A残) 合計人数】"}
-                    
+                    sum_D  = {"スタッフ名": "【夜勤(D) 人数】"}
+                    sum_E  = {"スタッフ名": "【夜勤明け(E) 人数】"}
+
                     for c in ['日勤(A/P)回数', '残業(A残)回数', '夜勤(D)回数', '公休回数']:
-                        sum_A[c] = ""; sum_Az[c] = ""
+                        sum_A[c] = ""; sum_Az[c] = ""; sum_D[c] = ""; sum_E[c] = ""
 
                     for d, c in enumerate(cols):
-                        sum_A[c] = sum(1 for e in range(num_staff) if str(df_res.loc[e, c]) in ['A', 'A残'] or 'P' in str(df_res.loc[e, c]) and "新人" not in str(staff_roles[e]))
+                        sum_A[c]  = sum(1 for e in range(num_staff) if str(df_res.loc[e, c]) in ['A', 'A残'] or 'P' in str(df_res.loc[e, c]) and "新人" not in str(staff_roles[e]))
                         sum_Az[c] = (df_res[c] == 'A残').sum()
+                        sum_D[c]  = (df_res[c] == 'D').sum()
+                        sum_E[c]  = (df_res[c] == 'E').sum()
 
-                    df_fin = pd.concat([df_res, pd.DataFrame([sum_A, sum_Az])], ignore_index=True)
+                    df_fin = pd.concat([df_res, pd.DataFrame([sum_A, sum_Az, sum_D, sum_E])], ignore_index=True)
 
                     def highlight_warnings(df):
                         styles = pd.DataFrame('', index=df.index, columns=df.columns)
@@ -669,6 +832,12 @@ if uploaded_file:
                         for d, col_name in enumerate(cols):
                             if "土" in col_name: styles.iloc[:, d+1] = 'background-color: #E6F2FF;'
                             elif "日" in col_name or "祝" in col_name: styles.iloc[:, d+1] = 'background-color: #FFE6E6;'
+
+                        # 希望休セルを黄色に（他の色より先に塗って上書きされる前提）
+                        for e in range(num_staff):
+                            for d in range(num_days):
+                                if (e, d) in hope_off_set:
+                                    styles.loc[e, cols[d]] = 'background-color: #FFFF00; font-weight: bold;'
                         
                         for d, col_name in enumerate(cols):
                             actual_a = df.loc[len(staff_names), col_name]
@@ -709,56 +878,79 @@ if uploaded_file:
                     with pd.ExcelWriter(output, engine='openpyxl') as writer:
                         df_fin.to_excel(writer, index=False, sheet_name='完成シフト')
                         worksheet = writer.sheets['完成シフト']
-                        
+
                         font_meiryo = Font(name='Meiryo')
                         border_thin = Border(left=Side(style='thin'), right=Side(style='thin'), top=Side(style='thin'), bottom=Side(style='thin'))
                         align_center = Alignment(horizontal='center', vertical='center')
                         align_left = Alignment(horizontal='left', vertical='center')
-                        
-                        fill_sat = PatternFill(start_color="E6F2FF", end_color="E6F2FF", fill_type="solid")
-                        fill_sun = PatternFill(start_color="FFE6E6", end_color="FFE6E6", fill_type="solid")
-                        fill_short = PatternFill(start_color="FFCCCC", end_color="FFCCCC", fill_type="solid")
-                        fill_over = PatternFill(start_color="CCFFFF", end_color="CCFFFF", fill_type="solid")
-                        fill_4days = PatternFill(start_color="FFFF99", end_color="FFFF99", fill_type="solid")
-                        fill_n3 = PatternFill(start_color="FFD580", end_color="FFD580", fill_type="solid")
-                        fill_n3_consec = PatternFill(start_color="E6E6FA", end_color="E6E6FA", fill_type="solid")
 
+                        fill_sat       = PatternFill(start_color="E6F2FF", end_color="E6F2FF", fill_type="solid")
+                        fill_sun       = PatternFill(start_color="FFE6E6", end_color="FFE6E6", fill_type="solid")
+                        fill_short     = PatternFill(start_color="FFCCCC", end_color="FFCCCC", fill_type="solid")
+                        fill_over      = PatternFill(start_color="CCFFFF", end_color="CCFFFF", fill_type="solid")
+                        fill_4days     = PatternFill(start_color="FFFF99", end_color="FFFF99", fill_type="solid")
+                        fill_n3        = PatternFill(start_color="FFD580", end_color="FFD580", fill_type="solid")
+                        fill_n3_consec = PatternFill(start_color="E6E6FA", end_color="E6E6FA", fill_type="solid")
+                        fill_hope_off  = PatternFill(start_color="FFFF00", end_color="FFFF00", fill_type="solid")
+
+                        # ── 印刷用：各スタッフ行の下に空白行を挿入（下から挿入でズレ防止）
+                        for e in range(num_staff - 1, -1, -1):
+                            insert_row = e + 3  # ヘッダー1行 + スタッフ行(e+2) の次
+                            worksheet.insert_rows(insert_row)
+
+                        # 挿入後の行番号マップ: スタッフe → Excelの行番号
+                        # e番目スタッフは (e+1)*2 行目（ヘッダーが1行、スタッフ+空白で2行ずつ）
+                        def staff_row(e): return (e + 1) * 2
+                        # 集計行（日勤合計）は staff_names の後
+                        sum_row_start = num_staff * 2 + 2
+
+                        # ── 全セルにフォント・ボーダー・アライン ──
                         for row in worksheet.iter_rows(min_row=1, max_row=worksheet.max_row, min_col=1, max_col=worksheet.max_column):
                             for cell in row:
                                 cell.font = font_meiryo
                                 cell.border = border_thin
                                 cell.alignment = align_left if cell.column == 1 else align_center
 
+                        # ── 土曜・日祝の列塗り ──
                         for c_idx, col_name in enumerate(cols):
                             if "土" in col_name:
-                                for r_idx in range(1, len(df_fin) + 2): worksheet.cell(row=r_idx, column=c_idx+2).fill = fill_sat
+                                for r_idx in range(1, worksheet.max_row + 1):
+                                    worksheet.cell(row=r_idx, column=c_idx+2).fill = fill_sat
                             elif "日" in col_name or "祝" in col_name:
-                                for r_idx in range(1, len(df_fin) + 2): worksheet.cell(row=r_idx, column=c_idx+2).fill = fill_sun
+                                for r_idx in range(1, worksheet.max_row + 1):
+                                    worksheet.cell(row=r_idx, column=c_idx+2).fill = fill_sun
 
-                        row_a_idx = len(staff_names) + 2
+                        # ── 日勤合計行の色（不足=赤、超過=青）──
                         for d, col_name in enumerate(cols):
                             actual_a = df_fin.loc[len(staff_names), col_name]
                             if actual_a != "":
-                                if actual_a < day_req_list[d]: worksheet.cell(row=row_a_idx, column=d+2).fill = fill_short
-                                elif actual_a > day_req_list[d]: worksheet.cell(row=row_a_idx, column=d+2).fill = fill_over
+                                if actual_a < day_req_list[d]:   worksheet.cell(row=sum_row_start, column=d+2).fill = fill_short
+                                elif actual_a > day_req_list[d]: worksheet.cell(row=sum_row_start, column=d+2).fill = fill_over
 
+                        # ── スタッフ行の色（希望休・4連勤・夜勤前3連・夜勤3連続）──
                         for e in range(num_staff):
+                            xl_row = staff_row(e)
                             for d in range(num_days):
-                                def is_d_work(day_idx):
+                                def is_d_work(day_idx, _e=e):
                                     if day_idx >= num_days: return False
-                                    v = str(df_fin.loc[e, cols[day_idx]])
+                                    v = str(df_fin.loc[_e, cols[day_idx]])
                                     return v == 'A' or v == 'A残' or 'P' in v or 'Ｐ' in v
 
+                                # 希望休（黄色）
+                                if (e, d) in hope_off_set:
+                                    worksheet.cell(row=xl_row, column=d+2).fill = fill_hope_off
+                                    continue  # 希望休は他の色より優先
+
                                 if is_d_work(d) and is_d_work(d+1) and is_d_work(d+2) and is_d_work(d+3):
-                                    for k in range(4): worksheet.cell(row=e+2, column=d+k+2).fill = fill_4days
+                                    for k in range(4): worksheet.cell(row=xl_row, column=d+k+2).fill = fill_4days
 
                                 if d + 3 < num_days:
                                     if is_d_work(d) and is_d_work(d+1) and is_d_work(d+2) and str(df_fin.loc[e, cols[d+3]]) == 'D':
-                                        for k in range(4): worksheet.cell(row=e+2, column=d+k+2).fill = fill_n3
-                                        
+                                        for k in range(4): worksheet.cell(row=xl_row, column=d+k+2).fill = fill_n3
+
                                 if d + 8 < num_days:
                                     if str(df_fin.loc[e, cols[d]]) == 'D' and str(df_fin.loc[e, cols[d+3]]) == 'D' and str(df_fin.loc[e, cols[d+6]]) == 'D':
-                                        for k in range(9): worksheet.cell(row=e+2, column=d+k+2).fill = fill_n3_consec
+                                        for k in range(9): worksheet.cell(row=xl_row, column=d+k+2).fill = fill_n3_consec
 
                     processed_data = output.getvalue()
                     
