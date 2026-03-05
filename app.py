@@ -82,7 +82,15 @@ if uploaded_file:
         night_req_list = get_req_col("夜勤人数", 2)
         overtime_req_list = get_req_col("残業人数", 0)
         absolute_req_list = get_req_col("絶対確保", "", is_int=False)
-        weekdays = [str(df_req.iloc[0, d+1]).strip() if (d+1) < len(df_req.columns) and pd.notna(df_req.iloc[0, d+1]) else "" for d in range(num_days)]
+        # 曜日はエクセルの値を使わず、選択された年月と日付から自動計算（ズレ防止）
+        _weekday_map = ["月", "火", "水", "木", "金", "土", "日"]
+        weekdays = []
+        for _d_val in date_columns:
+            try:
+                _dt = datetime.date(target_year, target_month, int(_d_val))
+                weekdays.append(_weekday_map[_dt.weekday()])
+            except (ValueError, TypeError):
+                weekdays.append("")
 
         # =====================================
         # 🔍 不可能理由の診断関数（新規追加）
