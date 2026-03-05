@@ -633,11 +633,15 @@ if uploaded_file:
         if 'step3_failed' not in st.session_state:
             st.session_state.step3_failed = False
 
+        ALL_SEEDS = [7, 42, 137, 512, 9999, 31415, 271828, 100003, 777777, 999983]
+        num_patterns = st.selectbox("🔢 作成するシフトのパターン数", [1, 2, 3, 4, 5], index=2)
+        use_seeds = ALL_SEEDS[:num_patterns]
+
         if not st.session_state.needs_compromise:
-            if st.button("▶️ 【STEP 1】まずは妥協なしで理想のシフトを計算する（5パターン）"):
-                with st.spinner('AIが「妥協なし」の完璧なシフトを5パターン模索中...'):
+            if st.button(f"▶️ 【STEP 1】まずは妥協なしで理想のシフトを計算する（{num_patterns}パターン）"):
+                with st.spinner(f'AIが「妥協なし」の完璧なシフトを{num_patterns}パターン模索中...'):
                     results = []
-                    for seed in [7, 42, 137, 512, 9999]:
+                    for seed in use_seeds:
                         solver, shifts = solve_shift(seed, False, False, False, False, False, False, False)
                         if solver: results.append((solver, shifts))
 
@@ -735,10 +739,10 @@ if uploaded_file:
             with col4:
                 allow_ot_consec = st.checkbox("「残業A残の2日連続」を許可する", value=bool(_r[4]))
 
-            if st.button("🔄 【STEP 3】選んだ妥協案で5パターン作成"):
+            if st.button(f"🔄 【STEP 3】選んだ妥協案で{num_patterns}パターン作成"):
                 with st.spinner('計算中...'):
                     results = []
-                    for seed in [7, 42, 137, 512, 9999]:
+                    for seed in use_seeds:
                         solver, shifts = solve_shift(seed, allow_minus_1, allow_4_days, allow_night_3, allow_sub_only, allow_ot_consec, allow_night_consec_3, False)
                         if solver: results.append((solver, shifts))
                     if results:
@@ -757,10 +761,10 @@ if uploaded_file:
                 st.warning("日曜は設定人数を固定しているため、さらに厳しい場合はここで許可できます。")
                 allow_sun_minus_1 = st.checkbox("日曜の出勤人数を設定より-1にする（リーダー在勤時のみ）", value=bool(_r[6]))
 
-                if st.button("🔄 【STEP 4】日曜-1も加えて5パターン作成"):
+                if st.button(f"🔄 【STEP 4】日曜-1も加えて{num_patterns}パターン作成"):
                     with st.spinner('計算中...'):
                         results = []
-                        for seed in [7, 42, 137, 512, 9999]:
+                        for seed in use_seeds:
                             solver, shifts = solve_shift(seed, allow_minus_1, allow_4_days, allow_night_3, allow_sub_only, allow_ot_consec, allow_night_consec_3, allow_sun_minus_1)
                             if solver: results.append((solver, shifts))
                         if results:
