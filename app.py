@@ -88,108 +88,192 @@ if uploaded_file:
         # 🔍 不可能理由の診断関数（新規追加）
         # =====================================
         def diagnose_infeasibility():
-            issues = []
+            """
+            シフトが組めない原因を詳細に分析して表示する。
+            ① スタッフ別 稼働余力テーブル
+            ② 日別 人員過不足テーブル
+            ③ 前月末の夜勤チェーン影響
+            ④ 希望休が集中している日
+            ⑤ リーダー不足・夜勤総量・残業要員などの全体チェック
+            """
 
-            # ── 1. 夜勤できるスタッフ数 vs 必要夜勤人数 ──
+            # ────────────────────────────────────────────
+            # 事前集計：スタッフ別の希望休（固定公休）一覧
+            # ────────────────────────────────────────────
+            fixed_off = [0] * num_staff          # スタッフeの固定公休日数
+            fixed_off_days_list = [[] for _ in range(num_staff)]  # スタッフeの固定公休日リスト
+            fixed_off_per_day = [0] * num_days   # d日目の固定公休人数
+
+            # 前月末シフト（前月最終日）
+            prev_last_shift = {}   # {e: "D"/"E"/"A"/...}
+            for e, staff_name in enumerate(staff_names):
+                tr = df_history[df_history.iloc[:, 0] == staff_name]
+                if not tr.empty:
+                    # 前月最終日（列5）
+                    if tr.shape[1] > 5:
+                        prev_last_shift[e] = str(tr.iloc[0, 5]).strip()
+                    # 希望休（列6以降）
+                    for d in range(num_days):
+                        col_idx = 6 + d
+                        if col_idx < tr.shape[1] and str(tr.iloc[0, col_idx]).strip() == "公":
+                            fixed_off[e] += 1
+                            fixed_off_days_list[e].append(d)
+                            fixed_off_per_day[d] += 1
+
+            # ────────────────────────────────────────────
+            # 前月末夜勤チェーンで今月頭が強制される日
+            # ────────────────────────────────────────────
+            # forced_block[d] = [(staff_name, reason), ...]
+            forced_block = [[] for _ in range(num_days)]
+            for e, staff_name in enumerate(staff_names):
+                last = prev_last_shift.get(e, "")
+                if last == "D":
+                    # 1日目→E確定、2日目→公確定
+                    if num_days > 0: forced_block[0].append((staff_name, "前月末がDのためE確定"))
+                    if num_days > 1: forced_block[1].append((staff_name, "前月末がDのためE翌日→公確定"))
+                elif last == "E":
+                    # 1日目→公確定
+                    if num_days > 0: forced_block[0].append((staff_name, "前月末がEのため公確定"))
+
+            # ────────────────────────────────────────────
+            # ① スタッフ別 稼働余力テーブル
+            # ────────────────────────────────────────────
+            staff_table_rows = []
+            staff_warnings = []
+            for e in range(num_staff):
+                total_days = num_days
+                f_off = fixed_off[e]
+                required_off = staff_off_days[e]
+                remaining_off_to_assign = max(0, required_off - f_off)
+                free_days = total_days - f_off  # 希望休を除いた日数
+                work_days = free_days - remaining_off_to_assign  # 実働可能日数（公休引き後）
+
+                # 前月チェーンで強制ブロックされる日数
+                chain_block = 0
+                if prev_last_shift.get(e, "") == "D": chain_block = 2
+                elif prev_last_shift.get(e, "") == "E": chain_block = 1
+                actual_work = work_days - chain_block
+
+                night_limit = staff_night_limits[e] if staff_night_ok[e] != "×" else 0
+                night_label = f"{night_limit}回上限" if staff_night_ok[e] != "×" else "夜勤不可"
+
+                # 判定
+                if required_off > total_days:
+                    status = "🔴 公休数が日数超過"
+                    staff_warnings.append(f"**{staff_names[e]}**：公休数({required_off}日) が月の日数({total_days}日)を超えています！")
+                elif actual_work < 0:
+                    status = "🔴 実働日数が足りない"
+                    staff_warnings.append(f"**{staff_names[e]}**：希望休({f_off}日)+残り公休({remaining_off_to_assign}日)+前月チェーン({chain_block}日) = {f_off+remaining_off_to_assign+chain_block}日が拘束され、実働できる日が足りません。")
+                elif actual_work <= 3:
+                    status = "🟡 実働日数が少ない"
+                    staff_warnings.append(f"**{staff_names[e]}**：実働可能日数が **{actual_work}日** しかありません（希望休{f_off}日＋残り公休{remaining_off_to_assign}日＋前月チェーン{chain_block}日）。")
+                else:
+                    status = "🟢 問題なし"
+
+                staff_table_rows.append({
+                    "スタッフ名": staff_names[e],
+                    "役割": staff_roles[e],
+                    "月日数": total_days,
+                    "希望休(固定)": f_off,
+                    "残り公休割当": remaining_off_to_assign,
+                    "前月チェーン拘束": chain_block,
+                    "実働可能日数": max(0, actual_work),
+                    "夜勤": night_label,
+                    "判定": status,
+                })
+
+            df_staff_diag = pd.DataFrame(staff_table_rows)
+
+            # ────────────────────────────────────────────
+            # ② 日別 人員過不足テーブル
+            # ────────────────────────────────────────────
+            day_table_rows = []
+            day_warnings = []
+            for d in range(num_days):
+                day_label = f"{date_columns[d]}({weekdays[d]})"
+
+                # その日にブロックされているスタッフを集計
+                blocked_names = []
+                # 希望休
+                for e in range(num_staff):
+                    if d in fixed_off_days_list[e]:
+                        blocked_names.append(f"{staff_names[e]}(希望休)")
+                # 前月チェーン強制
+                for (sname, reason) in forced_block[d]:
+                    if not any(sname in b for b in blocked_names):
+                        blocked_names.append(f"{sname}({reason})")
+
+                blocked_count = len(blocked_names)
+                # 夜勤(D)はその日にDシフトが入るので日勤から除外
+                night_consuming = night_req_list[d]  # D勤務人数
+                # Eシフト：前日がDの人はその日E確定（今月1日以降）
+                e_consuming = night_req_list[d - 1] if d > 0 else 0
+
+                available_for_day = num_staff - blocked_count - night_consuming - e_consuming
+                required_day = day_req_list[d]
+                required_ot  = overtime_req_list[d]
+                total_required = required_day + required_ot
+
+                gap = available_for_day - total_required
+
+                if gap < 0:
+                    status = f"🔴 {abs(gap)}人不足"
+                    blocked_str = "、".join(blocked_names[:5]) + ("…他" if len(blocked_names) > 5 else "")
+                    day_warnings.append(
+                        f"**{day_label}**：必要{total_required}人 に対し最大{max(0,available_for_day)}人しか確保できません。"
+                        + (f"（ブロック：{blocked_str}）" if blocked_names else "")
+                    )
+                elif gap <= 1:
+                    status = "🟡 ギリギリ"
+                else:
+                    status = "🟢 OK"
+
+                day_table_rows.append({
+                    "日付": day_label,
+                    "必要日勤": required_day,
+                    "必要残業": required_ot,
+                    "必要夜勤(D)": night_consuming,
+                    "希望休人数": fixed_off_per_day[d],
+                    "前月チェーン拘束": len(forced_block[d]),
+                    "利用可能人数(推定)": max(0, available_for_day),
+                    "判定": status,
+                })
+
+            df_day_diag = pd.DataFrame(day_table_rows)
+
+            # ────────────────────────────────────────────
+            # ③ 希望休が集中している日を検出
+            # ────────────────────────────────────────────
+            congestion_days = []
+            for d in range(num_days):
+                if fixed_off_per_day[d] >= max(2, num_staff // 3):
+                    names_off = [staff_names[e] for e in range(num_staff) if d in fixed_off_days_list[e]]
+                    congestion_days.append(f"**{date_columns[d]}日({weekdays[d]})**：{len(names_off)}名が希望休（{', '.join(names_off)}）")
+
+            # ────────────────────────────────────────────
+            # ④ 夜勤総量・リーダー・残業の全体チェック
+            # ────────────────────────────────────────────
+            global_issues = []
             night_capable = [e for e in range(num_staff) if staff_night_ok[e] != "×"]
             total_night_capacity = sum(staff_night_limits[e] for e in night_capable)
             total_night_required = sum(night_req_list)
             if total_night_capacity < total_night_required:
-                issues.append(
-                    f"🌙 **夜勤人数が足りません**\n"
-                    f"　→ 月間の夜勤必要回数の合計：**{total_night_required}回**\n"
-                    f"　→ 夜勤可能スタッフの上限合計：**{total_night_capacity}回**\n"
-                    f"　→ **{total_night_required - total_night_capacity}回分**、夜勤できる人が足りていません。\n"
-                    f"　💡 対策：夜勤上限を増やすか、夜勤可能スタッフを追加してください。"
-                )
-
+                global_issues.append(f"🌙 **夜勤総量不足**：月合計夜勤 **{total_night_required}回** 必要なのに、スタッフ上限合計は **{total_night_capacity}回** です。（不足：{total_night_required-total_night_capacity}回）")
             if len(night_capable) < 2:
-                issues.append(
-                    f"🌙 **夜勤対応スタッフが少なすぎます**\n"
-                    f"　→ 夜勤可能スタッフが **{len(night_capable)}名** しかいません。\n"
-                    f"　→ 夜勤ルール（D→E→公）を毎日回すには最低2名以上必要です。\n"
-                    f"　💡 対策：「夜勤可否」が「〇」のスタッフを増やしてください。"
-                )
+                global_issues.append(f"🌙 **夜勤可能スタッフが{len(night_capable)}名**：D→E→公のルールを回すには最低2名必要です。")
 
-            # ── 2. 公休数の合計チェック ──
-            total_off_required = sum(staff_off_days)
-            total_work_slots = num_staff * num_days
-            total_night_slots = sum(night_req_list) * 3  # D+E+翌公休 で3日消費
-            if total_off_required > total_work_slots * 0.6:
-                issues.append(
-                    f"📅 **公休数の合計が多すぎる可能性があります**\n"
-                    f"　→ 全スタッフの公休合計：**{total_off_required}日**（全スタッフ稼働可能日数の {total_off_required/total_work_slots*100:.0f}%）\n"
-                    f"　→ 公休が多すぎると、日勤・夜勤の人数を確保できなくなります。\n"
-                    f"　💡 対策：公休数を減らすか、スタッフを追加してください。"
-                )
-
-            # ── 3. 日別：日勤人数が絶対確保できない日を検出 ──
-            fixed_off_per_day = [0] * num_days
-            for e, staff_name in enumerate(staff_names):
-                tr = df_history[df_history.iloc[:, 0] == staff_name]
-                if not tr.empty:
-                    for d in range(num_days):
-                        col_idx = 6 + d
-                        if col_idx < tr.shape[1] and str(tr.iloc[0, col_idx]).strip() == "公":
-                            fixed_off_per_day[d] += 1
-
-            problem_days = []
-            for d in range(num_days):
-                available_staff = num_staff - fixed_off_per_day[d] - night_req_list[d] * 2
-                required = day_req_list[d]
-                if available_staff < required:
-                    day_label = f"{date_columns[d]}日({weekdays[d]})"
-                    problem_days.append(
-                        f"　・{day_label}：必要日勤 **{required}人** に対し、希望休・夜勤を除くと最大 **{max(0, available_staff)}人** しか確保できません"
-                    )
-
-            if problem_days:
-                issues.append(
-                    f"📋 **以下の日に日勤人数が確保できない可能性があります**\n"
-                    + "\n".join(problem_days[:10])  # 多すぎる場合は10件まで表示
-                    + ("\n　　…（他にも問題のある日があります）" if len(problem_days) > 10 else "")
-                    + f"\n　💡 対策：その日の希望休を見直すか、日勤必要人数の設定を下げてください。"
-                )
-
-            # ── 4. リーダー・サブリーダーの確認 ──
             leader_count = sum(1 for r in staff_roles if "主任" in str(r) or "リーダー" in str(r) or "サブ" in str(r))
             if leader_count == 0:
-                issues.append(
-                    f"👤 **リーダー・サブリーダーがいません**\n"
-                    f"　→ シフトには毎日「主任/リーダー」または「サブリーダー」が必須です。\n"
-                    f"　→ 現在、該当する役割のスタッフが **0名** です。\n"
-                    f"　💡 対策：スタッフ設定の「役割」に「主任」「リーダー」「サブ」のいずれかを設定してください。"
-                )
+                global_issues.append("👤 **リーダー/サブリーダーが0名**：毎日の日勤にリーダー系が必須のためシフトが組めません。")
             elif leader_count == 1:
-                issues.append(
-                    f"👤 **リーダー系スタッフが1名しかいません**\n"
-                    f"　→ 公休や夜勤でリーダーが不在の日に、日勤を組めなくなる場合があります。\n"
-                    f"　💡 対策：サブリーダーを追加するか、「役割」の設定を見直してください。"
-                )
+                global_issues.append(f"👤 **リーダー系が1名のみ**：公休・夜勤でリーダーが不在になる日が発生します。")
 
-            # ── 5. 残業人数の確認 ──
             ot_capable = sum(1 for e in range(num_staff) if staff_overtime_ok[e] != "×")
             total_ot_required = sum(overtime_req_list)
             if total_ot_required > 0 and ot_capable == 0:
-                issues.append(
-                    f"⏰ **残業できるスタッフがいません**\n"
-                    f"　→ 残業が必要な日がありますが、「残業可否」が「〇」のスタッフが **0名** です。\n"
-                    f"　💡 対策：残業可否の設定を見直すか、残業人数の要件を0にしてください。"
-                )
+                global_issues.append(f"⏰ **残業要員が0名**：残業が必要な日がありますが「残業可否〇」のスタッフがいません。")
 
-            # ── 6. 全体の診断結果メッセージ ──
-            if not issues:
-                issues.append(
-                    "🔎 **明確な単一原因は特定できませんでした**\n"
-                    "　→ 複数の制約が複合的に競合している可能性があります。\n"
-                    "　→ よくある原因：\n"
-                    "　　・希望休が特定の曜日に集中している\n"
-                    "　　・夜勤ルール（D→E→公の3日連続）により日勤可能日が減少している\n"
-                    "　　・公休数と夜勤セット数の組み合わせで稼働日数が不足している\n"
-                    "　💡 対策：下記の妥協案を複数チェックして再計算してみてください。"
-                )
-
-            return issues
+            return df_staff_diag, staff_warnings, df_day_diag, day_warnings, congestion_days, global_issues
 
         st.success("✅ データの読み込み完了！まずは妥協なしの「理想のシフト」を作れるかテストします。")
 
@@ -427,16 +511,66 @@ if uploaded_file:
             st.error("⚠️ 【AI店長からのご報告】\n申し訳ありません。現在の人数と希望休では、すべてのルールを完璧に守ってシフトを組むことは不可能でした...")
 
             # =====================================
-            # 🔍 不可能理由の診断結果を表示（新規追加）
+            # 🔍 詳細診断レポートを表示
             # =====================================
-            with st.expander("🔍 **【原因診断レポート】なぜ組めなかったのか？** ← クリックして確認", expanded=True):
-                st.markdown("#### 🤖 AIによる問題点の分析結果")
-                diagnosis = diagnose_infeasibility()
-                for i, issue in enumerate(diagnosis):
-                    st.markdown(f"**【問題 {i+1}】**")
-                    st.warning(issue)
+            df_staff_diag, staff_warnings, df_day_diag, day_warnings, congestion_days, global_issues = diagnose_infeasibility()
+
+            with st.expander("🔍 **【原因診断レポート】なぜ組めなかったのか？詳細分析** ← クリックして確認", expanded=True):
+
+                # ── 全体チェック ──
+                if global_issues:
+                    st.markdown("### ⚠️ 全体チェックで検出された問題")
+                    for g in global_issues:
+                        st.error(g)
+                    st.markdown("---")
+
+                # ── スタッフ別稼働余力テーブル ──
+                st.markdown("### 👥 ① スタッフ別 稼働余力チェック")
+                st.caption("🔴=明らかに不足　🟡=ギリギリ　🟢=問題なし　　※「実働可能日数」＝月日数－希望休－残り公休割当－前月チェーン拘束")
+
+                def color_staff_status(val):
+                    if "🔴" in str(val): return "background-color:#FFD0D0; font-weight:bold;"
+                    if "🟡" in str(val): return "background-color:#FFF5CC;"
+                    if "🟢" in str(val): return "background-color:#D8F5D8;"
+                    return ""
+                st.dataframe(df_staff_diag.style.applymap(color_staff_status, subset=["判定"]), use_container_width=True)
+
+                if staff_warnings:
+                    st.markdown("**🔎 スタッフ別の問題点：**")
+                    for w in staff_warnings:
+                        st.warning(w)
+                else:
+                    st.success("スタッフ個別の稼働余力は問題ありません。")
                 st.markdown("---")
-                st.markdown("*※ この診断は簡易チェックです。複合的な制約の競合は、下記の妥協案を試すことで解決できる場合があります。*")
+
+                # ── 日別過不足テーブル ──
+                st.markdown("### 📅 ② 日別 人員過不足チェック")
+                st.caption("🔴=不足確定　🟡=ギリギリ（希望休＋前月チェーン＋夜勤Dを除いた推定人数）　※残業人数は日勤に含めています")
+
+                def color_day_status(val):
+                    if "🔴" in str(val): return "background-color:#FFD0D0; font-weight:bold;"
+                    if "🟡" in str(val): return "background-color:#FFF5CC;"
+                    if "🟢" in str(val): return "background-color:#D8F5D8;"
+                    return ""
+                st.dataframe(df_day_diag.style.applymap(color_day_status, subset=["判定"]), use_container_width=True)
+
+                if day_warnings:
+                    st.markdown("**🔎 人数不足が確定している日：**")
+                    for w in day_warnings:
+                        st.error(w)
+                else:
+                    st.success("日別の人数は一見問題ありません。（複合的な制約が原因の可能性があります）")
+                st.markdown("---")
+
+                # ── 希望休集中日 ──
+                if congestion_days:
+                    st.markdown("### 🗓️ ③ 希望休が集中している日")
+                    for c in congestion_days:
+                        st.warning(c)
+                    st.caption("💡 希望休が同じ日に集中すると、その日の日勤・夜勤が確保できなくなります。")
+                    st.markdown("---")
+
+                st.caption("*※ この診断は推定値です。夜勤チェーンの連鎖による中盤以降のブロックは含まれていません。妥協案の組み合わせで解決できる場合があります。*")
 
             st.warning("💡 以下のいずれかの「妥協案」を許可して、再計算を指示してください。")
             
