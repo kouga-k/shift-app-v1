@@ -67,14 +67,19 @@ if uploaded_file:
         num_days = len(date_columns)
         
         def get_req_col(label, default_val, is_int=True):
+            # 位置番号(d+1)ではなく列名(date_columns[d])で引くことでズレを防止
             row = df_req[df_req.iloc[:, 0] == label]
             res = []
             for d in range(num_days):
-                if not row.empty and (d + 1) < len(df_req.columns):
-                    val = row.iloc[0, d + 1]
-                    if pd.notna(val):
-                        res.append(int(val) if is_int else str(val).strip())
-                        continue
+                col_name = date_columns[d]
+                try:
+                    if not row.empty and col_name in df_req.columns:
+                        val = row.iloc[0][col_name]
+                        if pd.notna(val):
+                            res.append(int(val) if is_int else str(val).strip())
+                            continue
+                except Exception:
+                    pass
                 res.append(default_val)
             return res
 
@@ -122,8 +127,8 @@ if uploaded_file:
                         prev_last_shift[e] = str(tr.iloc[0, 5]).strip()
                     # 希望休（列6以降）
                     for d in range(num_days):
-                        col_idx = 6 + d
-                        if col_idx < tr.shape[1] and str(tr.iloc[0, col_idx]).strip() == "公":
+                        col_name = date_columns[d]
+                        if col_name in tr.columns and str(tr.iloc[0][col_name]).strip() == "公":
                             fixed_off[e] += 1
                             fixed_off_days_list[e].append(d)
                             fixed_off_per_day[d] += 1
@@ -398,8 +403,9 @@ if uploaded_file:
                 tr = df_history[df_history.iloc[:, 0] == staff_name]
                 if not tr.empty:
                     for d in range(num_days):
-                        col_idx = 6 + d
-                        if col_idx < tr.shape[1] and str(tr.iloc[0, col_idx]).strip() == "公": model.Add(shifts[(e, d, '公')] == 1)
+                        col_name = date_columns[d]
+                        if col_name in tr.columns and str(tr.iloc[0][col_name]).strip() == "公":
+                            model.Add(shifts[(e, d, '公')] == 1)
 
             for e in range(num_staff):
                 model.Add(sum(shifts[(e, d, '公')] for d in range(num_days)) == int(staff_off_days[e]))
