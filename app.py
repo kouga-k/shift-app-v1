@@ -8,8 +8,8 @@ import random
 from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
 
 st.set_page_config(page_title="自動シフト作成アプリ", layout="wide")
-st.title("🤝 AIシフト作成 Co-Pilot")
-st.write("「定時確保」や「残業の逆比例公平化」を搭載した、実務完全対応のシフト作成システムです。")
+st.title("📅 シフト自動作成")
+st.write("希望休・夜勤ルール・役割条件を考慮して、最適なシフトを自動で作成します。")
 
 if 'needs_compromise' not in st.session_state:
     st.session_state.needs_compromise = False
@@ -289,9 +289,9 @@ if uploaded_file:
 
             return df_staff_diag, staff_warnings, df_day_diag, day_warnings, congestion_days, global_issues
 
-        st.success("✅ データの読み込み完了！まずは妥協なしの「理想のシフト」を作れるかテストします。")
+        st.success("✅ データ読み込み完了。シフトを作成します。")
 
-        def solve_shift(random_seed, allow_minus_1=False, allow_4_days=False, allow_night_3=False, allow_sub_only=False, allow_ot_consec=False, allow_night_consec_3=False, allow_sun_minus_1=False):
+        def solve_shift(random_seed, allow_minus_1=False, allow_4_days=False, allow_night_3=False, allow_sub_only=False, allow_ot_consec=False, allow_night_consec_3=False, allow_sun_minus_1=False, allow_abs_plus_1=False):
             model = cp_model.CpModel()
             types = ['A', 'A残', 'D', 'E', '公']
             shifts = {(e, d, s): model.NewBoolVar('') for e in range(num_staff) for d in range(num_days) for s in types}
@@ -373,10 +373,17 @@ if uploaded_file:
                 is_abs = (absolute_req_list[d] == "〇")
 
                 if is_abs:
+                    # 絶対確保日：設定人数以上が必須。allow_abs_plus_1なら+1まで許容（超過ペナルティ緩和）
                     model.Add(act_day >= req)
-                    over_var = model.NewIntVar(0, 100, ''); diff = model.NewIntVar(-100, 100, '')
-                    model.Add(diff == act_day - req); model.AddMaxEquality(over_var, [0, diff])
-                    penalties.append(over_var * 1)
+                    if not allow_abs_plus_1:
+                        over_var = model.NewIntVar(0, 100, ''); diff = model.NewIntVar(-100, 100, '')
+                        model.Add(diff == act_day - req); model.AddMaxEquality(over_var, [0, diff])
+                        penalties.append(over_var * 1)
+                    else:
+                        # +1まで許容（req+1超は大きなペナルティ）
+                        over_var = model.NewIntVar(0, 100, ''); diff = model.NewIntVar(-100, 100, '')
+                        model.Add(diff == act_day - (req + 1)); model.AddMaxEquality(over_var, [0, diff])
+                        penalties.append(over_var * 500)
                 elif is_sun:
                     # 日曜は設定人数固定。allow_sun_minus_1かつリーダー在勤の場合のみ-1を許可
                     model.Add(act_day <= req)
@@ -525,7 +532,7 @@ if uploaded_file:
 
         def solve_shift_fast(flags):
             """妥協案の必要性チェック専用。時間を短縮して実現可否だけ判定する。"""
-            m1, f4, n3, sub, ot, nc3, sun1 = flags
+            m1, f4, n3, sub, ot, nc3, sun1, abs1 = flags
             # 45秒では遅いので、内部で短い制限を使う専用ソルバーを呼ぶ
             # → solve_shiftのmax_time_in_secondsを短縮した版を直接組む
             from ortools.sat.python import cp_model as _cp
@@ -583,7 +590,9 @@ if uploaded_file:
                 _model.Add(sum(_shifts[(e,d,'A残')] for e in range(num_staff)) == overtime_req_list[d])
                 act_day = sum((_shifts[(e,d,'A')]+_shifts[(e,d,'A残')]) for e in range(num_staff) if "新人" not in str(staff_roles[e]))
                 req = day_req_list[d]; is_sun = ('日' in weekdays[d]); is_abs = (absolute_req_list[d]=="〇")
-                if is_abs: _model.Add(act_day >= req)
+                if is_abs:
+                    _model.Add(act_day >= req)
+                    if abs1: _model.Add(act_day <= req + 1)
                 elif is_sun:
                     _model.Add(act_day <= req)
                     if not sun1: _model.Add(act_day == req)
@@ -616,17 +625,18 @@ if uploaded_file:
             return _status in (_cp.OPTIMAL, _cp.FEASIBLE)
 
         # 妥協案の名称・引数位置の定義（順番固定）
-        # flags = (allow_minus_1, allow_4_days, allow_night_3, allow_sub_only, allow_ot_consec, allow_night_consec_3, allow_sun_minus_1)
+        # flags = (allow_minus_1, allow_4_days, allow_night_3, allow_sub_only, allow_ot_consec, allow_night_consec_3, allow_sun_minus_1, allow_abs_plus_1)
         COMPROMISE_LABELS = [
-            "日勤人数の「マイナス1」（平日・祝）",
+            "平日・祝の日勤人数を-1にする",
             "最大4連勤のお願い",
             "夜勤前3日連続日勤のお願い",
             "役割配置をサブ1名まで下げる",
             "残業(A残)の2日連続",
             "夜勤セット3連続（月またぎ含む）",
-            "日曜の出勤人数を設定より-1（リーダー在勤条件）",
+            "日曜の出勤人数を-1にする（リーダー在勤条件）",
+            "絶対確保日に+1を割り振る",
         ]
-        ALL_ON = (True, True, True, True, True, True, True)
+        ALL_ON = (True, True, True, True, True, True, True, True)
 
         if 'min_compromise_result' not in st.session_state:
             st.session_state.min_compromise_result = None
@@ -697,9 +707,9 @@ if uploaded_file:
                     st.error("😭 全妥協案をONにしても組めません。希望休や人数設定を見直してください。")
                     st.session_state.min_compromise_result = None
                 else:
-                    necessary = [True] * 7
-                    for i in range(7):
-                        progress.progress((i+1)/8, text=f"「{COMPROMISE_LABELS[i]}」が不要か確認中... ({i+1}/7)")
+                    necessary = [True] * 8
+                    for i in range(8):
+                        progress.progress((i+1)/9, text=f"「{COMPROMISE_LABELS[i]}」が不要か確認中... ({i+1}/8)")
                         flags_test = list(ALL_ON)
                         flags_test[i] = False
                         if solve_shift_fast(tuple(flags_test)):
@@ -709,8 +719,8 @@ if uploaded_file:
 
             if st.session_state.min_compromise_result is not None:
                 necessary = st.session_state.min_compromise_result
-                needed   = [COMPROMISE_LABELS[i] for i in range(7) if necessary[i]]
-                unneeded = [COMPROMISE_LABELS[i] for i in range(7) if not necessary[i]]
+                needed   = [COMPROMISE_LABELS[i] for i in range(8) if necessary[i]]
+                unneeded = [COMPROMISE_LABELS[i] for i in range(8) if not necessary[i]]
                 col_n, col_u = st.columns(2)
                 with col_n:
                     st.error("**🔴 必要な妥協案**")
@@ -721,17 +731,18 @@ if uploaded_file:
                 st.markdown("---")
 
             # ── 妥協案チェックボックス（日曜-1はここには出さない） ──
-            _r = st.session_state.min_compromise_result or [False]*7
+            _r = st.session_state.min_compromise_result or [False]*8
             st.markdown("### 📝 【STEP 2】妥協案を選んでください")
             col1, col2 = st.columns(2)
             with col1:
                 st.markdown("**■ 人数・役割**")
-                allow_minus_1  = st.checkbox("絶対確保日・日曜以外の日勤人数を-1にする", value=bool(_r[0]))
-                allow_sub_only = st.checkbox("役割配置を「サブ1名＋他」まで下げる", value=bool(_r[3]))
+                allow_minus_1    = st.checkbox("平日・祝の日勤人数を-1にする", value=bool(_r[0]))
+                allow_sub_only   = st.checkbox("役割配置を「サブ1名＋他」まで下げる", value=bool(_r[3]))
+                allow_abs_plus_1 = st.checkbox("絶対確保日に+1を割り振る", value=bool(_r[7]))
             with col2:
                 st.markdown("**■ 連勤・夜勤**")
-                allow_4_days   = st.checkbox("対象者への「最大4連勤」を許可する", value=bool(_r[1]))
-                allow_night_3  = st.checkbox("対象者への「夜勤前3日連続日勤」を許可する", value=bool(_r[2]))
+                allow_4_days  = st.checkbox("対象者への「最大4連勤」を許可する", value=bool(_r[1]))
+                allow_night_3 = st.checkbox("対象者への「夜勤前3日連続日勤」を許可する", value=bool(_r[2]))
             st.markdown("**■ その他**")
             col3, col4 = st.columns(2)
             with col3:
@@ -743,7 +754,7 @@ if uploaded_file:
                 with st.spinner('計算中...'):
                     results = []
                     for seed in use_seeds:
-                        solver, shifts = solve_shift(seed, allow_minus_1, allow_4_days, allow_night_3, allow_sub_only, allow_ot_consec, allow_night_consec_3, False)
+                        solver, shifts = solve_shift(seed, allow_minus_1, allow_4_days, allow_night_3, allow_sub_only, allow_ot_consec, allow_night_consec_3, False, allow_abs_plus_1)
                         if solver: results.append((solver, shifts))
                     if results:
                         st.success(f"✨ {len(results)}パターン完成！")
@@ -765,7 +776,7 @@ if uploaded_file:
                     with st.spinner('計算中...'):
                         results = []
                         for seed in use_seeds:
-                            solver, shifts = solve_shift(seed, allow_minus_1, allow_4_days, allow_night_3, allow_sub_only, allow_ot_consec, allow_night_consec_3, allow_sun_minus_1)
+                            solver, shifts = solve_shift(seed, allow_minus_1, allow_4_days, allow_night_3, allow_sub_only, allow_ot_consec, allow_night_consec_3, allow_sun_minus_1, allow_abs_plus_1)
                             if solver: results.append((solver, shifts))
                         if results:
                             st.success(f"✨ {len(results)}パターン完成！")
