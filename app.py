@@ -532,7 +532,8 @@ if uploaded_file:
 
         def solve_shift_fast(flags):
             """妥協案の必要性チェック専用。時間を短縮して実現可否だけ判定する。"""
-            m1, f4, n3, sub, ot, nc3, sun1, abs1 = flags
+            m1, f4, n3, sub, ot, nc3, sun1 = flags
+            abs1 = True  # 絶対確保日+1は常時適用
             # 45秒では遅いので、内部で短い制限を使う専用ソルバーを呼ぶ
             # → solve_shiftのmax_time_in_secondsを短縮した版を直接組む
             from ortools.sat.python import cp_model as _cp
@@ -625,7 +626,7 @@ if uploaded_file:
             return _status in (_cp.OPTIMAL, _cp.FEASIBLE)
 
         # 妥協案の名称・引数位置の定義（順番固定）
-        # flags = (allow_minus_1, allow_4_days, allow_night_3, allow_sub_only, allow_ot_consec, allow_night_consec_3, allow_sun_minus_1, allow_abs_plus_1)
+        # flags = (allow_minus_1, allow_4_days, allow_night_3, allow_sub_only, allow_ot_consec, allow_night_consec_3, allow_sun_minus_1)
         COMPROMISE_LABELS = [
             "平日・祝の日勤人数を-1にする",
             "最大4連勤のお願い",
@@ -634,9 +635,8 @@ if uploaded_file:
             "残業(A残)の2日連続",
             "夜勤セット3連続（月またぎ含む）",
             "日曜の出勤人数を-1にする（リーダー在勤条件）",
-            "絶対確保日に+1を割り振る",
         ]
-        ALL_ON = (True, True, True, True, True, True, True, True)
+        ALL_ON = (True, True, True, True, True, True, True)
 
         if 'min_compromise_result' not in st.session_state:
             st.session_state.min_compromise_result = None
@@ -652,7 +652,7 @@ if uploaded_file:
                 with st.spinner(f'AIが「妥協なし」の完璧なシフトを{num_patterns}パターン模索中...'):
                     results = []
                     for seed in use_seeds:
-                        solver, shifts = solve_shift(seed, False, False, False, False, False, False, False)
+                        solver, shifts = solve_shift(seed, False, False, False, False, False, False, False, True)
                         if solver: results.append((solver, shifts))
 
                     if results:
@@ -707,9 +707,9 @@ if uploaded_file:
                     st.error("😭 全妥協案をONにしても組めません。希望休や人数設定を見直してください。")
                     st.session_state.min_compromise_result = None
                 else:
-                    necessary = [True] * 8
-                    for i in range(8):
-                        progress.progress((i+1)/9, text=f"「{COMPROMISE_LABELS[i]}」が不要か確認中... ({i+1}/8)")
+                    necessary = [True] * 7
+                    for i in range(7):
+                        progress.progress((i+1)/8, text=f"「{COMPROMISE_LABELS[i]}」が不要か確認中... ({i+1}/7)")
                         flags_test = list(ALL_ON)
                         flags_test[i] = False
                         if solve_shift_fast(tuple(flags_test)):
@@ -719,8 +719,8 @@ if uploaded_file:
 
             if st.session_state.min_compromise_result is not None:
                 necessary = st.session_state.min_compromise_result
-                needed   = [COMPROMISE_LABELS[i] for i in range(8) if necessary[i]]
-                unneeded = [COMPROMISE_LABELS[i] for i in range(8) if not necessary[i]]
+                needed   = [COMPROMISE_LABELS[i] for i in range(7) if necessary[i]]
+                unneeded = [COMPROMISE_LABELS[i] for i in range(7) if not necessary[i]]
                 col_n, col_u = st.columns(2)
                 with col_n:
                     st.error("**🔴 必要な妥協案**")
@@ -731,14 +731,13 @@ if uploaded_file:
                 st.markdown("---")
 
             # ── 妥協案チェックボックス（日曜-1はここには出さない） ──
-            _r = st.session_state.min_compromise_result or [False]*8
+            _r = st.session_state.min_compromise_result or [False]*7
             st.markdown("### 📝 【STEP 2】妥協案を選んでください")
             col1, col2 = st.columns(2)
             with col1:
                 st.markdown("**■ 人数・役割**")
                 allow_minus_1    = st.checkbox("平日・祝の日勤人数を-1にする", value=bool(_r[0]))
                 allow_sub_only   = st.checkbox("役割配置を「サブ1名＋他」まで下げる", value=bool(_r[3]))
-                allow_abs_plus_1 = st.checkbox("絶対確保日に+1を割り振る", value=bool(_r[7]))
             with col2:
                 st.markdown("**■ 連勤・夜勤**")
                 allow_4_days  = st.checkbox("対象者への「最大4連勤」を許可する", value=bool(_r[1]))
@@ -749,6 +748,8 @@ if uploaded_file:
                 allow_night_consec_3 = st.checkbox("「夜勤セット3連続（月またぎ）」を許可する", value=bool(_r[5]))
             with col4:
                 allow_ot_consec = st.checkbox("「残業A残の2日連続」を許可する", value=bool(_r[4]))
+
+            allow_abs_plus_1 = True  # 絶対確保日への+1は常時自動適用
 
             if st.button(f"🔄 【STEP 3】選んだ妥協案で{num_patterns}パターン作成"):
                 with st.spinner('計算中...'):
