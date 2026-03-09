@@ -43,7 +43,10 @@ if uploaded_file:
             return res
 
         staff_roles = get_staff_col("役割", "一般")
-        staff_off_days = get_staff_col("公休数", 9, is_int=True)
+
+        # ── 公休数：週休2日制 → 2月=8日、それ以外=9日を自動設定（手入力が優先）──
+        _auto_off = 8 if target_month == 2 else 9
+        staff_off_days = get_staff_col("公休数", _auto_off, is_int=True)
         staff_night_ok = get_staff_col("夜勤可否", "〇")
         staff_overtime_ok = get_staff_col("残業可否", "〇")
         staff_part_shifts = get_staff_col("パート", "")
@@ -51,6 +54,39 @@ if uploaded_file:
         staff_min_normal_a = get_staff_col("定時確保数", 2, is_int=True)
         staff_sun_d = ["×" if ok == "×" else v for ok, v in zip(staff_night_ok, get_staff_col("日曜Dカウント", "〇"))]
         staff_sun_e = ["×" if ok == "×" else v for ok, v in zip(staff_night_ok, get_staff_col("日曜Eカウント", "〇"))]
+
+        # 有休・夏冬休関連
+        staff_join_month   = get_staff_col("入職月", 0, is_int=True)          # 入職月（1〜12）
+        staff_paid_given   = get_staff_col("有休付与日数", 10, is_int=True)    # 今年度付与日数
+        staff_paid_taken   = get_staff_col("有休取得済", 0, is_int=True)       # 今年度取得済累計
+        staff_summer_given = get_staff_col("夏季休暇付与", 3, is_int=True)     # 夏休付与日数（7〜9月で3日）
+        staff_summer_taken = get_staff_col("夏季休暇取得済", 0, is_int=True)   # 夏休取得済
+        staff_winter_given = get_staff_col("冬季休暇付与", 4, is_int=True)     # 冬休付与日数（12〜2月で4日）
+        staff_winter_taken = get_staff_col("冬季休暇取得済", 0, is_int=True)   # 冬休取得済
+
+        # 前月の公休実績（年間管理シートから）→ 繰り越しチェック用
+        staff_prev_off_actual = []
+        for e in range(num_staff):
+            val = get_annual_val(staff_names[e], "前月公休実績", _auto_off)
+            staff_prev_off_actual.append(int(val))
+
+        # 休暇優先順位ルール
+        # 公休(9日) ＞ 夏冬休 ＞ 年休
+        # 夏休：7〜9月に3日、冬休：12〜2月に4日
+        SUMMER_MONTHS = [7, 8, 9]
+        WINTER_MONTHS = [12, 1, 2]
+        SUMMER_TARGET = 3
+        WINTER_TARGET = 4
+
+        # 入職月別 義務取得日数テーブル（画像より）
+        PAID_OBLIGATION_TABLE = {
+            4: 2.5, 5: 2.5, 6: 2.0, 7: 1.5, 8: 1.0, 9: 0.5,
+            10: 5.0, 11: 5.0, 12: 4.5, 1: 4.0, 2: 3.5, 3: 3.0
+        }
+        # 入職月 → 最初の有休付与月（入職6ヶ月後）
+        def get_grant_month(join_month):
+            if join_month == 0: return 0
+            return ((join_month - 1 + 6) % 12) + 1
 
         staff_comp_lvl = []
         for i in range(num_staff):
@@ -119,8 +155,293 @@ if uploaded_file:
         fixed_off, fixed_off_days_list, fixed_off_per_day = build_fixed_off_info()
 
         # =============================================
-        # 🃏 AI交渉カード生成関数（★ 新機能）
+        # 📊 年間管理シート読み込み
         # =============================================
+        try:
+            df_annual = pd.read_excel(uploaded_file, sheet_name="年間管理")
+        except Exception:
+            # 年間管理シートがない場合は空のDataFrameを作成
+            df_annual = pd.DataFrame(columns=[
+                "スタッフ名", "入職月", "有休付与日数", "有休取得済(累計)", "有休残日数",
+                "義務取得日数", "義務残日数", "夏季付与", "夏季取得済", "冬季付与", "冬季取得済",
+                "夜勤累計", "残業累計", "連勤最大(過去最高)", "最終更新"
+            ])
+
+        def get_annual_val(name, col, default=0):
+            """年間管理シートから特定スタッフの値を取得"""
+            if df_annual.empty or col not in df_annual.columns:
+                return default
+            row = df_annual[df_annual["スタッフ名"] == name]
+            if row.empty or pd.isna(row.iloc[0][col]):
+                return default
+            try:
+                return float(row.iloc[0][col])
+            except Exception:
+                return default
+
+        # =============================================
+        # 📊 振り返りレポート生成関数
+        # =============================================
+        # 有休年度ルール：4月〜2月の間に年5日取得。3月は未取得分を強制消化。
+        # 現在が何月かで「残り取得可能月数」と「必要ペース」を計算する。
+        PAID_YEAR_TARGET = 5          # 年間義務取得日数
+        # 4月=1ヶ月目、5月=2ヶ月目…2月=11ヶ月目、3月は強制消化月
+        def months_in_period(m):
+            """4月を起点にした経過月数（4月=1, 5月=2, …, 2月=11, 3月=12）"""
+            return ((m - 4) % 12) + 1
+
+        def remaining_months_to_feb(m):
+            """現在月から2月末までの残り月数（3月シフト作成時は0）"""
+            if m == 3: return 0
+            period = months_in_period(m)
+            return 11 - period  # 11ヶ月目(2月)まであと何ヶ月
+
+        def build_review_report(df_fin, cols):
+            """
+            完成シフトdf_finから今月実績を集計し、以下を返す：
+            ・有休：4〜2月で年5日取得の月別ペース促し
+            ・夏休：7〜9月で3日取得促し
+            ・冬休：12〜2月で4日取得促し
+            ・公休：8日だった翌月は10日繰り越し警告
+            ・優先順位：公休 ＞ 夏冬休 ＞ 年休
+            """
+            report_rows = []
+            alerts       = []   # 黄色警告
+            red_alerts   = []   # 赤色強制対応
+            march_forced = []   # 3月強制消化
+
+            remain_months = remaining_months_to_feb(target_month)
+            is_march = (target_month == 3)
+
+            # 今月の公休実績（シフト表から集計）→ 来月繰り越し判定用
+            off_actual_this = {}
+
+            for e in range(num_staff):
+                name = staff_names[e]
+
+                # ── 今月実績 ──
+                night_this  = int(df_fin.loc[e, "夜勤(D)回数"]) if "夜勤(D)回数" in df_fin.columns else 0
+                ot_this     = int(df_fin.loc[e, "残業(A残)回数"]) if "残業(A残)回数" in df_fin.columns else 0
+                off_this    = int(df_fin.loc[e, "公休回数"]) if "公休回数" in df_fin.columns else _auto_off
+                off_actual_this[name] = off_this
+
+                # 連勤最大日数
+                max_consec = 0; cur = 0
+                for d in range(num_days):
+                    v = str(df_fin.loc[e, cols[d]]) if d < len(cols) else ""
+                    if v in ['A', 'A残'] or 'P' in v:
+                        cur += 1; max_consec = max(max_consec, cur)
+                    else:
+                        cur = 0
+
+                # ── 年間累計 ──
+                night_cum       = int(get_annual_val(name, "夜勤累計", 0)) + night_this
+                ot_cum          = int(get_annual_val(name, "残業累計", 0)) + ot_this
+                max_consec_past = int(get_annual_val(name, "連勤最大(過去最高)", 0))
+                max_consec_all  = max(max_consec_past, max_consec)
+
+                # ────────────────────────────────────────
+                # ① 公休チェック（最優先）
+                # ────────────────────────────────────────
+                prev_off = staff_prev_off_actual[e]   # 前月公休実績
+                carryover_needed = 0
+                off_judgement = []
+
+                if prev_off < 9:
+                    shortage = 9 - prev_off
+                    carryover_needed = 9 + shortage  # 来月は9+不足分
+                    off_judgement.append(f"⚠️ 前月公休{prev_off}日→今月{carryover_needed}日繰越必要")
+                    alerts.append(
+                        f"**{name}**：前月の公休が **{prev_off}日** でした（基準9日）。"
+                        f"今月は **{carryover_needed}日** の公休が必要です。"
+                        f"※公休不足は緊急時のみ。しっかり休養するよう声がけを。"
+                    )
+                if off_this < 9 and off_this > 0:
+                    off_judgement.append(f"🟡 今月公休{off_this}日（基準9日）")
+                    alerts.append(
+                        f"**{name}**：今月の公休が **{off_this}日** です。"
+                        f"週休2日制のため基準は9日です。緊急時以外はしっかり休養させてください。"
+                        f"（来月は繰り越し{9+(9-off_this)}日が必要になります）"
+                    )
+
+                # ────────────────────────────────────────
+                # ② 夏季休暇チェック（7〜9月）
+                # ────────────────────────────────────────
+                sum_given  = int(get_annual_val(name, "夏季付与", SUMMER_TARGET))
+                sum_taken  = int(get_annual_val(name, "夏季取得済", staff_summer_taken[e]))
+                sum_remain = max(0, sum_given - sum_taken)
+                sum_judgement = []
+
+                if target_month in SUMMER_MONTHS:
+                    # 夏休期間中
+                    months_left_summer = SUMMER_MONTHS[-1] - target_month  # 9月まであと何ヶ月
+                    if sum_remain > 0:
+                        if months_left_summer == 0:
+                            # 9月末が最後のチャンス
+                            sum_judgement.append(f"🔴 夏休{sum_remain}日未取得（今月が最終）")
+                            red_alerts.append(
+                                f"**{name}**：夏季休暇が **{sum_remain}日** 未取得です。"
+                                f"9月が最終月のため、今月のシフトに必ず組み込んでください。"
+                            )
+                        else:
+                            sum_judgement.append(f"🟡 夏休残{sum_remain}日（残{months_left_summer}ヶ月）")
+                            alerts.append(
+                                f"**{name}**：夏季休暇が残 **{sum_remain}日** です。"
+                                f"9月末までに取得してください（残{months_left_summer}ヶ月）。"
+                            )
+                    else:
+                        sum_judgement.append("🟢 夏休取得完了")
+                elif target_month > 9:
+                    if sum_remain > 0:
+                        sum_judgement.append(f"⚠️ 夏休{sum_remain}日未消化（期間外）")
+
+                # ────────────────────────────────────────
+                # ③ 冬季休暇チェック（12〜2月）
+                # ────────────────────────────────────────
+                win_given  = int(get_annual_val(name, "冬季付与", WINTER_TARGET))
+                win_taken  = int(get_annual_val(name, "冬季取得済", staff_winter_taken[e]))
+                win_remain = max(0, win_given - win_taken)
+                win_judgement = []
+
+                if target_month in WINTER_MONTHS:
+                    # 冬休期間中：12月=残2ヶ月、1月=残1ヶ月、2月=最終
+                    months_left_winter = (2 - target_month) % 12  # 2月まであと何ヶ月（12月→2, 1月→1, 2月→0）
+                    if target_month == 12: months_left_winter = 2
+                    elif target_month == 1: months_left_winter = 1
+                    else: months_left_winter = 0
+
+                    if win_remain > 0:
+                        if months_left_winter == 0:
+                            win_judgement.append(f"🔴 冬休{win_remain}日未取得（今月が最終）")
+                            red_alerts.append(
+                                f"**{name}**：冬季休暇が **{win_remain}日** 未取得です。"
+                                f"2月が最終月のため、今月のシフトに必ず組み込んでください。"
+                            )
+                        else:
+                            win_judgement.append(f"🟡 冬休残{win_remain}日（残{months_left_winter}ヶ月）")
+                            alerts.append(
+                                f"**{name}**：冬季休暇が残 **{win_remain}日** です。"
+                                f"2月末までに取得してください（残{months_left_winter}ヶ月）。"
+                            )
+                    else:
+                        win_judgement.append("🟢 冬休取得完了")
+                elif target_month > 2 and target_month < 12:
+                    if win_remain > 0:
+                        win_judgement.append(f"⚠️ 冬休{win_remain}日未消化")
+
+                # ────────────────────────────────────────
+                # ④ 有休チェック（4〜2月 年5日）※最低優先
+                # ────────────────────────────────────────
+                paid_given       = int(get_annual_val(name, "有休付与日数", staff_paid_given[e]))
+                paid_taken_total = float(get_annual_val(name, "有休取得済(累計)", staff_paid_taken[e]))
+                paid_remain      = max(0.0, paid_given - paid_taken_total)
+                year_short       = max(0.0, PAID_YEAR_TARGET - paid_taken_total)
+
+                join_m = staff_join_month[e]
+                first_year_obligation = PAID_OBLIGATION_TABLE.get(join_m, 5.0) if join_m != 0 else 5.0
+                first_year_short = max(0.0, first_year_obligation - paid_taken_total)
+
+                paid_judgement = []
+
+                if is_march and year_short > 0:
+                    paid_judgement.append(f"🔴 3月強制消化{year_short}日")
+                    red_alerts.append(
+                        f"**{name}**：年間有休5日に対し **{year_short}日** 未達です。"
+                        f"3月シフトに必ず有休を組み込んでください。"
+                    )
+                    march_forced.append({"name": name, "days": year_short})
+                elif not is_march:
+                    period_elapsed   = months_in_period(target_month)
+                    expected_by_now  = round(PAID_YEAR_TARGET * period_elapsed / 11, 1)
+                    if remain_months > 0:
+                        needed_per_month = round(year_short / remain_months, 1) if year_short > 0 else 0
+                        pace_msg = f"残{remain_months}ヶ月・残{year_short}日（月{needed_per_month}日ペース）"
+                    else:
+                        pace_msg = "2月末 達成済み" if year_short == 0 else f"2月末 {year_short}日未達"
+
+                    if year_short == 0:
+                        paid_judgement.append("🎉 有休5日達成")
+                    elif paid_taken_total < expected_by_now - 1:
+                        paid_judgement.append(f"🟡 有休ペース遅れ（{pace_msg}）")
+                        alerts.append(
+                            f"**{name}**：有休取得が遅れています。{pace_msg}。"
+                            f"このまま進むと2月末に義務未達になる恐れがあります。"
+                            f"公休・夏冬休の後に有休を計画的に配置してください。"
+                        )
+                    else:
+                        paid_judgement.append(f"🟢 有休進行中（{pace_msg}）")
+
+                if first_year_short > 0 and join_m != 0:
+                    paid_judgement.append(f"⚠️ 初年度義務残{first_year_short}日")
+
+                # ── 全判定まとめ ──
+                judgements = off_judgement + sum_judgement + win_judgement + paid_judgement
+                if max_consec >= 4:
+                    judgements.append(f"⚠️ 最大{max_consec}連勤")
+                if not judgements:
+                    judgements.append("🟢 問題なし")
+
+                report_rows.append({
+                    "スタッフ名":     name,
+                    "役割":           staff_roles[e],
+                    "今月公休":       off_this,
+                    "今月夜勤":       night_this,
+                    "今月残業":       ot_this,
+                    "今月最大連勤":   max_consec,
+                    "夜勤累計(年)":   night_cum,
+                    "残業累計(年)":   ot_cum,
+                    "有休取得済":     paid_taken_total,
+                    "有休残":         paid_remain,
+                    "年間義務残":     year_short,
+                    "夏休残":         sum_remain,
+                    "冬休残":         win_remain,
+                    "判定":           " / ".join(judgements),
+                    # 年間管理更新用
+                    "_night_cum":     night_cum,
+                    "_ot_cum":        ot_cum,
+                    "_max_consec":    max_consec_all,
+                    "_paid_given":    paid_given,
+                    "_paid_taken":    paid_taken_total,
+                    "_paid_remain":   paid_remain,
+                    "_year_short":    year_short,
+                    "_sum_given":     sum_given,
+                    "_sum_taken":     sum_taken,
+                    "_win_given":     win_given,
+                    "_win_taken":     win_taken,
+                    "_off_this":      off_this,
+                })
+
+            df_report = pd.DataFrame(report_rows)
+            return df_report, alerts, red_alerts, march_forced
+
+
+        def build_annual_excel(df_report):
+            """振り返りレポートをもとに年間管理シートを更新したExcelを返す"""
+            update_month = f"{target_year}/{target_month:02d}"
+            rows = []
+            for _, r in df_report.iterrows():
+                rows.append({
+                    "スタッフ名":           r["スタッフ名"],
+                    "入職月":               staff_join_month[staff_names.index(r["スタッフ名"])],
+                    "有休付与日数":          r["_paid_given"],
+                    "有休取得済(累計)":      r["_paid_taken"],
+                    "有休残日数":            r["_paid_remain"],
+                    "年間義務残日数":        r["_year_short"],
+                    "夏季付与":             r["_sum_given"],
+                    "夏季取得済":           r["_sum_taken"],
+                    "冬季付与":             r["_win_given"],
+                    "冬季取得済":           r["_win_taken"],
+                    "夜勤累計":             r["_night_cum"],
+                    "残業累計":             r["_ot_cum"],
+                    "連勤最大(過去最高)":    r["_max_consec"],
+                    "前月公休実績":          r["_off_this"],   # ← 来月の繰り越しチェック用
+                    "最終更新":              update_month,
+                })
+            return pd.DataFrame(rows)
+
+
+
+
         def generate_compromise_cards(necessary):
             """
             必要な妥協案ごとに「誰が・何日・なぜ」を具体的に示すカードを生成する。
@@ -953,15 +1274,21 @@ if uploaded_file:
                     else: cols.append(f"{d_val}({w_val})")
                 except ValueError: cols.append(f"{d_val}({w_val})")
 
-            hope_off_set = set()
+            hope_off_set = set()       # 希望休（黄色）
+            hope_shift_dict = {}       # 希望シフト（水色）: (e, d) -> シフト種別
+            VALID_SHIFTS = {'A', 'A残', 'D', 'E', '公'}
             for e, staff_name in enumerate(staff_names):
                 tr = df_history[df_history.iloc[:, 0] == staff_name]
                 if not tr.empty:
                     history_today_cols = list(tr.columns[6:])
                     for d in range(num_days):
                         col_name = date_columns[d]
-                        if col_name in history_today_cols and str(tr.iloc[0][col_name]).strip() == "公":
-                            hope_off_set.add((e, d))
+                        if col_name in history_today_cols:
+                            val = str(tr.iloc[0][col_name]).strip()
+                            if val == "公":
+                                hope_off_set.add((e, d))
+                            elif val in VALID_SHIFTS:
+                                hope_shift_dict[(e, d)] = val
 
             tabs = st.tabs([f"提案パターン {i + 1}" for i in range(len(results))])
             for i, (solver, shifts) in enumerate(results):
@@ -1005,6 +1332,8 @@ if uploaded_file:
                             for d in range(num_days):
                                 if (e, d) in hope_off_set:
                                     styles.loc[e, cols[d]] = 'background-color: #FFFF00; font-weight: bold;'
+                                elif (e, d) in hope_shift_dict:
+                                    styles.loc[e, cols[d]] = 'background-color: #FFFF00; font-weight: bold;'
                         for d, col_name in enumerate(cols):
                             actual_a = df.loc[len(staff_names), col_name]
                             target_a = day_req_list[d]
@@ -1029,32 +1358,122 @@ if uploaded_file:
 
                     st.dataframe(df_fin.style.apply(highlight_warnings, axis=None))
 
+                    # =============================================
+                    # 📊 振り返りレポート & 有休・夏冬休管理
+                    # =============================================
+                    with st.expander("📊 振り返りレポート & 有休・休暇管理を見る", expanded=False):
+                        df_report, alerts, red_alerts, march_forced = build_review_report(df_fin, cols)
+
+                        # ── 休暇優先順位の説明 ──
+                        st.info("📋 **休暇優先順位**：公休（9日）＞ 夏季休暇（7〜9月・3日）＞ 冬季休暇（12〜2月・4日）＞ 年休（4〜2月・年5日）")
+                        st.markdown("---")
+
+                        # ── 🚨 赤色：強制対応アラート ──
+                        if red_alerts:
+                            st.markdown("### 🚨 要対応（今月シフトに必ず組み込んでください）")
+                            for a in red_alerts:
+                                st.error(a)
+                            st.markdown("---")
+
+                        # ── 3月強制消化スタッフ一覧 ──
+                        if target_month == 3 and march_forced:
+                            st.error("### 🚨 3月シフト：以下のスタッフに有休を必ず組み込んでください")
+                            for mf in march_forced:
+                                st.error(f"　👤 **{mf['name']}**：有休 **{mf['days']}日** を3月中に取得させてください。")
+                            st.markdown("---")
+
+                        # ── 🟡 黄色：注意アラート ──
+                        if alerts:
+                            st.markdown("### ⚠️ 注意・促しアラート")
+                            for a in alerts:
+                                st.warning(a)
+                            st.markdown("---")
+
+                        # ── スタッフ別サマリー表 ──
+                        st.markdown("### 👥 スタッフ別サマリー")
+                        display_cols = [
+                            "スタッフ名", "役割",
+                            "今月公休", "今月夜勤", "今月残業", "今月最大連勤",
+                            "夜勤累計(年)", "残業累計(年)",
+                            "有休取得済", "有休残", "年間義務残",
+                            "夏休残", "冬休残", "判定"
+                        ]
+                        df_disp = df_report[display_cols].copy()
+
+                        def color_report(val):
+                            s = str(val)
+                            if "🔴" in s or "🚨" in s: return "background-color:#FFD0D0; font-weight:bold;"
+                            if "🟡" in s or "⚠️" in s: return "background-color:#FFF5CC;"
+                            if "🎉" in s: return "background-color:#D8F5D8; font-weight:bold;"
+                            if "🟢" in s: return "background-color:#D8F5D8;"
+                            return ""
+
+                        st.dataframe(
+                            df_disp.style.applymap(color_report, subset=["判定"]),
+                            use_container_width=True
+                        )
+
+                        # ── 有休進捗バー ──
+                        st.markdown("### 📅 有休取得進捗（4月〜2月 年5日ルール）")
+                        remain_m = remaining_months_to_feb(target_month)
+                        if target_month == 3:
+                            st.error("📌 3月は強制消化月です。未達スタッフは必ずシフトに有休を組み込んでください。")
+                        elif remain_m == 0:
+                            st.info("📌 2月末が締め切りです。今月取得できなかった分は3月に強制消化になります。")
+                        else:
+                            st.info(f"📌 現在 **{target_month}月**。2月末まで残り **{remain_m}ヶ月**。年5日取得が目標です（優先度：公休＞夏冬休＞年休）。")
+
+                        progress_data = df_report[["スタッフ名", "有休取得済", "年間義務残"]].set_index("スタッフ名")
+                        st.bar_chart(progress_data)
+
+                        # ── 夏冬休グラフ（対象期間のみ） ──
+                        if target_month in SUMMER_MONTHS:
+                            st.markdown("### ☀️ 夏季休暇残日数（7〜9月で3日取得）")
+                            st.bar_chart(df_report[["スタッフ名", "夏休残"]].set_index("スタッフ名"))
+                        if target_month in WINTER_MONTHS:
+                            st.markdown("### ❄️ 冬季休暇残日数（12〜2月で4日取得）")
+                            st.bar_chart(df_report[["スタッフ名", "冬休残"]].set_index("スタッフ名"))
+
+                        # ── 夜勤・残業グラフ ──
+                        st.markdown("### 📈 今月の夜勤・残業回数")
+                        st.bar_chart(df_report[["スタッフ名", "今月夜勤", "今月残業"]].set_index("スタッフ名"))
+
+                        st.markdown("---")
+                        st.info("💾 年間管理シートは下の「📥 シフト管理ファイルをダウンロード」に含まれています。")
+
+                    # =============================================
+                    # 📥 統合Excelダウンロード（1ファイルに全シート）
+                    # =============================================
+                    st.markdown("---")
+                    st.markdown(f"### 📥 パターン {i + 1} をダウンロード")
+                    st.caption("完成シフト・予定実績・年間管理がすべて1ファイルに含まれます。来月もこのファイルをアップロードしてください。")
+
                     output = io.BytesIO()
                     with pd.ExcelWriter(output, engine='openpyxl') as writer:
+
+                        # ── ① 完成シフトシート ──
                         df_fin.to_excel(writer, index=False, sheet_name='完成シフト')
                         worksheet = writer.sheets['完成シフト']
                         font_meiryo = Font(name='Meiryo')
                         border_thin = Border(left=Side(style='thin'), right=Side(style='thin'), top=Side(style='thin'), bottom=Side(style='thin'))
                         align_center = Alignment(horizontal='center', vertical='center')
-                        align_left = Alignment(horizontal='left', vertical='center')
-                        fill_sat = PatternFill(start_color="E6F2FF", end_color="E6F2FF", fill_type="solid")
-                        fill_sun = PatternFill(start_color="FFE6E6", end_color="FFE6E6", fill_type="solid")
-                        fill_short = PatternFill(start_color="FFCCCC", end_color="FFCCCC", fill_type="solid")
-                        fill_over = PatternFill(start_color="CCFFFF", end_color="CCFFFF", fill_type="solid")
-                        fill_4days = PatternFill(start_color="FFFF99", end_color="FFFF99", fill_type="solid")
-                        fill_n3 = PatternFill(start_color="FFD580", end_color="FFD580", fill_type="solid")
-                        fill_n3_consec = PatternFill(start_color="E6E6FA", end_color="E6E6FA", fill_type="solid")
-                        fill_hope_off = PatternFill(start_color="FFFF00", end_color="FFFF00", fill_type="solid")
+                        align_left   = Alignment(horizontal='left',  vertical='center')
+                        fill_sat        = PatternFill(start_color="E6F2FF", end_color="E6F2FF", fill_type="solid")
+                        fill_sun        = PatternFill(start_color="FFE6E6", end_color="FFE6E6", fill_type="solid")
+                        fill_short      = PatternFill(start_color="FFCCCC", end_color="FFCCCC", fill_type="solid")
+                        fill_over       = PatternFill(start_color="CCFFFF", end_color="CCFFFF", fill_type="solid")
+                        fill_4days      = PatternFill(start_color="FFFF99", end_color="FFFF99", fill_type="solid")
+                        fill_n3         = PatternFill(start_color="FFD580", end_color="FFD580", fill_type="solid")
+                        fill_n3_consec  = PatternFill(start_color="E6E6FA", end_color="E6E6FA", fill_type="solid")
+                        fill_hope_off   = PatternFill(start_color="FFFF00", end_color="FFFF00", fill_type="solid")
+                        fill_hope_shift = PatternFill(start_color="FFFF00", end_color="FFFF00", fill_type="solid")
                         for e in range(num_staff - 1, -1, -1):
-                            insert_row = e + 3
-                            worksheet.insert_rows(insert_row)
-
+                            worksheet.insert_rows(e + 3)
                         def staff_row(e): return (e + 1) * 2
                         sum_row_start = num_staff * 2 + 2
                         for row in worksheet.iter_rows(min_row=1, max_row=worksheet.max_row, min_col=1, max_col=worksheet.max_column):
                             for cell in row:
-                                cell.font = font_meiryo
-                                cell.border = border_thin
+                                cell.font = font_meiryo; cell.border = border_thin
                                 cell.alignment = align_left if cell.column == 1 else align_center
                         for c_idx, col_name in enumerate(cols):
                             if "土" in col_name:
@@ -1074,25 +1493,137 @@ if uploaded_file:
                                     v = str(df_fin.loc[_e, cols[day_idx]])
                                     return v == 'A' or v == 'A残' or 'P' in v or 'Ｐ' in v
                                 if (e, d) in hope_off_set:
-                                    worksheet.cell(row=xl_row, column=d + 2).fill = fill_hope_off
-                                    continue
-                                if is_d_work(d) and is_d_work(d + 1) and is_d_work(d + 2) and is_d_work(d + 3):
-                                    for k in range(4): worksheet.cell(row=xl_row, column=d + k + 2).fill = fill_4days
+                                    worksheet.cell(row=xl_row, column=d + 2).fill = fill_hope_off; continue
+                                if (e, d) in hope_shift_dict:
+                                    worksheet.cell(row=xl_row, column=d + 2).fill = fill_hope_shift; continue
+                                if is_d_work(d) and is_d_work(d+1) and is_d_work(d+2) and is_d_work(d+3):
+                                    for k in range(4): worksheet.cell(row=xl_row, column=d+k+2).fill = fill_4days
                                 if d + 3 < num_days:
-                                    if is_d_work(d) and is_d_work(d + 1) and is_d_work(d + 2) and str(df_fin.loc[e, cols[d + 3]]) == 'D':
-                                        for k in range(4): worksheet.cell(row=xl_row, column=d + k + 2).fill = fill_n3
+                                    if is_d_work(d) and is_d_work(d+1) and is_d_work(d+2) and str(df_fin.loc[e, cols[d+3]]) == 'D':
+                                        for k in range(4): worksheet.cell(row=xl_row, column=d+k+2).fill = fill_n3
                                 if d + 8 < num_days:
-                                    if str(df_fin.loc[e, cols[d]]) == 'D' and str(df_fin.loc[e, cols[d + 3]]) == 'D' and str(df_fin.loc[e, cols[d + 6]]) == 'D':
-                                        for k in range(9): worksheet.cell(row=xl_row, column=d + k + 2).fill = fill_n3_consec
+                                    if str(df_fin.loc[e, cols[d]]) == 'D' and str(df_fin.loc[e, cols[d+3]]) == 'D' and str(df_fin.loc[e, cols[d+6]]) == 'D':
+                                        for k in range(9): worksheet.cell(row=xl_row, column=d+k+2).fill = fill_n3_consec
 
-                    processed_data = output.getvalue()
+                        # ── ② 予定・実績シート ──
+                        # スタッフごとに「予定」「実績」の2行を作成
+                        plan_actual_rows = []
+                        for e in range(num_staff):
+                            # 予定行（アプリが自動入力）
+                            row_plan = {"スタッフ名": staff_names[e], "区分": "予定"}
+                            for d in range(num_days):
+                                row_plan[cols[d]] = str(df_fin.loc[e, cols[d]])
+                            plan_actual_rows.append(row_plan)
+                            # 実績行（変更があった日だけ手入力。空欄＝予定通り）
+                            row_actual = {"スタッフ名": staff_names[e], "区分": "実績"}
+                            for d in range(num_days):
+                                row_actual[cols[d]] = ""
+                            plan_actual_rows.append(row_actual)
+
+                        df_pa = pd.DataFrame(plan_actual_rows)
+                        df_pa.to_excel(writer, index=False, sheet_name='予定・実績')
+                        ws_pa = writer.sheets['予定・実績']
+
+                        # 書式設定
+                        fill_plan_hdr   = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")  # 予定行 濃青
+                        fill_actual_hdr = PatternFill(start_color="70AD47", end_color="70AD47", fill_type="solid")  # 実績行 緑
+                        fill_plan_cell  = PatternFill(start_color="DDEEFF", end_color="DDEEFF", fill_type="solid")  # 予定セル 薄青
+                        fill_actual_cell= PatternFill(start_color="F2F9EE", end_color="F2F9EE", fill_type="solid")  # 実績セル 薄緑（入力欄）
+                        font_white      = Font(name='Meiryo', bold=True, color="FFFFFF")
+                        font_normal     = Font(name='Meiryo')
+                        font_gray       = Font(name='Meiryo', color="888888", italic=True)
+
+                        # ヘッダー行
+                        for cell in ws_pa[1]:
+                            cell.fill = fill_plan_hdr; cell.font = font_white
+                            cell.alignment = align_center; cell.border = border_thin
+                        ws_pa.column_dimensions['A'].width = 14
+                        ws_pa.column_dimensions['B'].width = 6
+                        for col_idx in range(3, num_days + 3):
+                            ws_pa.column_dimensions[ws_pa.cell(row=1, column=col_idx).column_letter].width = 5
+
+                        # データ行の色分け
+                        for row_idx in range(2, len(plan_actual_rows) + 2):
+                            kubun_cell = ws_pa.cell(row=row_idx, column=2)
+                            is_plan = (kubun_cell.value == "予定")
+                            for col_idx in range(1, num_days + 3):
+                                cell = ws_pa.cell(row=row_idx, column=col_idx)
+                                cell.border = border_thin
+                                cell.alignment = align_center if col_idx > 1 else align_left
+                                if col_idx <= 2:
+                                    # スタッフ名・区分列
+                                    cell.fill = fill_plan_hdr if is_plan else fill_actual_hdr
+                                    cell.font = font_white
+                                elif is_plan:
+                                    cell.fill = fill_plan_cell
+                                    cell.font = font_normal
+                                else:
+                                    cell.fill = fill_actual_cell
+                                    cell.font = font_gray
+                                    if cell.value == "" or cell.value is None:
+                                        cell.value = None  # 空欄を明示（入力欄として）
+
+                        # 土日祝の列色（予定・実績どちらも）
+                        for d, col_name in enumerate(cols):
+                            col_idx = d + 3
+                            col_letter = ws_pa.cell(row=1, column=col_idx).column_letter
+                            if "土" in col_name:
+                                ws_pa.cell(row=1, column=col_idx).fill = PatternFill(start_color="5B9BD5", end_color="5B9BD5", fill_type="solid")
+                            elif "日" in col_name or "祝" in col_name:
+                                ws_pa.cell(row=1, column=col_idx).fill = PatternFill(start_color="C00000", end_color="C00000", fill_type="solid")
+
+                        # 使い方メモを末尾に追記
+                        note_row = len(plan_actual_rows) + 3
+                        ws_pa.cell(row=note_row, column=1).value = "【記入方法】"
+                        ws_pa.cell(row=note_row, column=1).font = Font(name='Meiryo', bold=True)
+                        ws_pa.cell(row=note_row+1, column=1).value = "・実績行は変更があった日だけ入力してください（空欄＝予定通り）"
+                        ws_pa.cell(row=note_row+2, column=1).value = "・入力例：急な欠勤→「公」、希望休変更→「A」など"
+                        ws_pa.cell(row=note_row+3, column=1).value = "・月末にこのファイルをアップロードすると実績ベースで年間管理が更新されます"
+                        for nr in range(note_row, note_row+4):
+                            ws_pa.cell(row=nr, column=1).font = Font(name='Meiryo', color="555555")
+
+                        # ── ③ 年間管理シート ──
+                        df_report_for_annual, _, _, _ = build_review_report(df_fin, cols)
+                        df_new_annual = build_annual_excel(df_report_for_annual)
+                        df_new_annual.to_excel(writer, index=False, sheet_name="年間管理")
+                        ws_annual = writer.sheets["年間管理"]
+                        header_fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
+                        header_font = Font(name='Meiryo', bold=True, color="FFFFFF")
+                        alert_fill  = PatternFill(start_color="FFD0D0", end_color="FFD0D0", fill_type="solid")
+                        ok_fill     = PatternFill(start_color="D8F5D8", end_color="D8F5D8", fill_type="solid")
+                        warn_fill   = PatternFill(start_color="FFF5CC", end_color="FFF5CC", fill_type="solid")
+                        for cell in ws_annual[1]:
+                            cell.fill = header_fill; cell.font = header_font
+                            cell.alignment = Alignment(horizontal='center', vertical='center')
+                        cols_annual = list(df_new_annual.columns)
+                        def ac(col_name_a):
+                            return cols_annual.index(col_name_a) + 1 if col_name_a in cols_annual else None
+                        for row_idx in range(2, num_staff + 2):
+                            for col_name_a, threshold, red_ok in [
+                                ("年間義務残日数", 0, True),
+                                ("有休残日数", 1, False),
+                                ("前月公休実績", 8, False),
+                            ]:
+                                ci = ac(col_name_a)
+                                if ci is None: continue
+                                val = ws_annual.cell(row=row_idx, column=ci).value or 0
+                                fval = float(val)
+                                if red_ok and fval > threshold:
+                                    ws_annual.cell(row=row_idx, column=ci).fill = alert_fill
+                                elif not red_ok and fval <= threshold:
+                                    ws_annual.cell(row=row_idx, column=ci).fill = warn_fill
+                                elif red_ok:
+                                    ws_annual.cell(row=row_idx, column=ci).fill = ok_fill
+                        ws_annual.column_dimensions['A'].width = 14
+
                     st.download_button(
-                        label=f"📥 【パターン {i + 1}】 をエクセルでダウンロード（レイアウト完成版）",
-                        data=processed_data,
-                        file_name=f"完成版_レイアウト適用シフト_{i + 1}.xlsx",
+                        label=f"📥 シフト管理ファイルをダウンロード（パターン {i + 1}・{target_year}/{target_month:02d}）",
+                        data=output.getvalue(),
+                        file_name=f"シフト管理_{target_year}{target_month:02d}_パターン{i + 1}.xlsx",
                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                         key=f"dl_btn_{i}"
                     )
+                    st.caption("📋 ファイルの中身：① 完成シフト（印刷用）　② 予定・実績（月中に実績を手入力）　③ 年間管理（来月引き継ぎ用）")
 
     except Exception as e:
         st.error(f"⚠️ エラーが発生しました: エクセルの形式が間違っているか、空白の行があります。({e})")
