@@ -83,12 +83,6 @@ if uploaded_file:
         staff_winter_given = get_staff_col("冬季休暇付与", 4, is_int=True)     # 冬休付与日数（12〜2月で4日）
         staff_winter_taken = get_staff_col("冬季休暇取得済", 0, is_int=True)   # 冬休取得済
 
-        # 前月の公休実績（年間管理シートから）→ 繰り越しチェック用
-        staff_prev_off_actual = []
-        for e in range(num_staff):
-            val = get_annual_val(staff_names[e], "前月公休実績", _auto_off)
-            staff_prev_off_actual.append(int(val))
-
         # 休暇優先順位ルール
         # 公休(9日) ＞ 夏冬休 ＞ 年休
         # 夏休：7〜9月に3日、冬休：12〜2月に4日
@@ -197,6 +191,12 @@ if uploaded_file:
                 return float(row.iloc[0][col])
             except Exception:
                 return default
+
+        # 前月の公休実績（年間管理シートから）→ 繰り越しチェック用
+        staff_prev_off_actual = []
+        for e in range(num_staff):
+            val = get_annual_val(staff_names[e], "前月公休実績", _auto_off)
+            staff_prev_off_actual.append(int(val))
 
         # =============================================
         # 📊 振り返りレポート生成関数
