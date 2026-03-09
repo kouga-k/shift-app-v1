@@ -5,7 +5,26 @@ import io
 import jpholiday
 import datetime
 import random
+import calendar
+from openpyxl import Workbook
 from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
+
+# ── ログイン管理 ──
+if "logged_in" not in st.session_state:
+    st.session_state["logged_in"] = False
+
+if not st.session_state["logged_in"]:
+    st.set_page_config(page_title="ログイン", layout="centered")
+    st.title("🔐 ログイン")
+    user_id  = st.text_input("ID")
+    password = st.text_input("PASS", type="password")
+    if st.button("ログイン"):
+        if user_id == "admin" and password == "1234":
+            st.session_state["logged_in"] = True
+            st.rerun()
+        else:
+            st.error("IDまたはパスワードが違います")
+    st.stop()
 
 st.set_page_config(page_title="自動シフト作成アプリ", layout="wide")
 st.title("📅 シフト自動作成")
