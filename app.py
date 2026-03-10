@@ -1618,12 +1618,29 @@ if uploaded_file:
                     st.markdown(f"### 📥 パターン {i + 1} をダウンロード")
                     st.caption("完成シフト・予定実績・年間管理がすべて1ファイルに含まれます。来月もこのファイルをアップロードしてください。")
 
+                    # Excel用：列名を日付数字のみに変換（曜日は2行目に別途書き込む）
+                    cols_day   = [str(date_columns[d]) for d in range(num_days)]
+                    cols_label = ["スタッフ名"] + cols_day + ["日勤(A/P)回数", "残業(A残)回数", "夜勤(D)回数", "公休回数"]
+                    df_fin_xl  = df_fin.rename(columns=dict(zip(["スタッフ名"] + cols + ["日勤(A/P)回数","残業(A残)回数","夜勤(D)回数","公休回数"], cols_label)))
+
                     output = io.BytesIO()
                     with pd.ExcelWriter(output, engine='openpyxl') as writer:
 
                         # ── ① 完成シフトシート ──
-                        df_fin.to_excel(writer, index=False, sheet_name='完成シフト')
+                        df_fin_xl.to_excel(writer, index=False, sheet_name='完成シフト')
                         worksheet = writer.sheets['完成シフト']
+                        # 曜日行を2行目に挿入
+                        worksheet.insert_rows(2)
+                        weekday_colors = {"月":"FFFFFF","火":"FFFFFF","水":"FFFFFF","木":"FFFFFF","金":"FFFFFF","土":"BDD7EE","日":"FFCCCC","祝":"FFCCCC"}
+                        worksheet.cell(row=2, column=1).value = ""
+                        for d, col_name in enumerate(cols):
+                            wday = weekdays[d]
+                            is_hol = jpholiday.is_holiday(datetime.date(target_year, target_month, int(date_columns[d]))) if str(date_columns[d]).isdigit() else False
+                            label = "祝" if is_hol else wday
+                            c = worksheet.cell(row=2, column=d + 2)
+                            c.value = label
+                            bg = "FFCCCC" if is_hol else weekday_colors.get(wday, "FFFFFF")
+                            c.fill = PatternFill(start_color=bg, end_color=bg, fill_type="solid")
                         font_meiryo = Font(name='Meiryo')
                         border_thin = Border(left=Side(style='thin'), right=Side(style='thin'), top=Side(style='thin'), bottom=Side(style='thin'))
                         align_center = Alignment(horizontal='center', vertical='center')
@@ -1639,8 +1656,8 @@ if uploaded_file:
                         fill_hope_shift = PatternFill(start_color="FFFF00", end_color="FFFF00", fill_type="solid")
                         for e in range(num_staff - 1, -1, -1):
                             worksheet.insert_rows(e + 3)
-                        def staff_row(e): return (e + 1) * 2
-                        sum_row_start = num_staff * 2 + 2
+                        def staff_row(e): return (e + 1) * 2 + 1
+                        sum_row_start = num_staff * 2 + 3
                         for row in worksheet.iter_rows(min_row=1, max_row=worksheet.max_row, min_col=1, max_col=worksheet.max_column):
                             for cell in row:
                                 cell.font = font_meiryo; cell.border = border_thin
