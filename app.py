@@ -8,25 +8,161 @@ import random
 import calendar
 from openpyxl import Workbook
 from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
+from google.cloud import storage
 
-# ── ログイン管理 ──
-if "logged_in" not in st.session_state:
-    st.session_state["logged_in"] = False
+# =============================================
+# ユーザー管理（Cloud Storage）
+# =============================================
+GCS_BUCKET = "shift-app-users"
+GCS_FILE   = "users.csv"
+
+def load_users():
+    """Cloud StorageからユーザーCSVを読み込む"""
+    try:
+        client = storage.Client()
+        bucket = client.bucket(GCS_BUCKET)
+        blob   = bucket.blob(GCS_FILE)
+        data   = blob.download_as_text(encoding="utf-8-sig")
+        from io import StringIO
+        df = pd.read_csv(StringIO(data), dtype=str).fillna("")
+        return df
+    except Exception:
+        return pd.DataFrame(columns=["スタッフ名","ID","PW","権限"])
+
+def save_users(df):
+    """ユーザーCSVをCloud Storageに保存"""
+    try:
+        client = storage.Client()
+        bucket = client.bucket(GCS_BUCKET)
+        blob   = bucket.blob(GCS_FILE)
+        blob.upload_from_string(df.to_csv(index=False), content_type="text/csv")
+        return True
+    except Exception:
+        return False
+
+def check_login(user_id, password):
+    df = load_users()
+    row = df[(df["ID"] == user_id) & (df["PW"] == password)]
+    if not row.empty:
+        return row.iloc[0]["権限"], row.iloc[0]["スタッフ名"]
+    return None, None
+
+# =============================================
+# ログイン管理
+# =============================================
+st.set_page_config(page_title="自動シフト作成アプリ", layout="wide")
+
+for key, val in [("logged_in", False), ("user_role", ""), ("user_name", ""), ("user_id", "")]:
+    if key not in st.session_state:
+        st.session_state[key] = val
 
 if not st.session_state["logged_in"]:
-    st.set_page_config(page_title="ログイン", layout="centered")
     st.title("🔐 ログイン")
-    user_id  = st.text_input("ID")
-    password = st.text_input("PASS", type="password")
-    if st.button("ログイン"):
-        if user_id == "admin" and password == "1234":
-            st.session_state["logged_in"] = True
-            st.rerun()
-        else:
-            st.error("IDまたはパスワードが違います")
+    st.write("")
+    col1, col2, col3 = st.columns([1,2,1])
+    with col2:
+        user_id  = st.text_input("ID")
+        password = st.text_input("パスワード", type="password")
+        if st.button("ログイン", use_container_width=True):
+            role, name = check_login(user_id, password)
+            if role:
+                st.session_state["logged_in"] = True
+                st.session_state["user_role"]  = role
+                st.session_state["user_name"]  = name
+                st.session_state["user_id"]    = user_id
+                st.rerun()
+            else:
+                st.error("IDまたはパスワードが違います")
     st.stop()
 
-st.set_page_config(page_title="自動シフト作成アプリ", layout="wide")
+# ── サイドバー：ユーザー情報・ログアウト ──
+with st.sidebar:
+    st.markdown(f"👤 **{st.session_state['user_name']}** さん")
+    st.caption(f"権限：{st.session_state['user_role']}")
+    st.markdown("---")
+
+    # 自分のパスワード変更
+    with st.expander("🔑 パスワードを変更する"):
+        pw_now  = st.text_input("現在のパスワード", type="password", key="pw_now")
+        pw_new  = st.text_input("新しいパスワード", type="password", key="pw_new")
+        pw_new2 = st.text_input("新しいパスワード（確認）", type="password", key="pw_new2")
+        if st.button("変更する", key="btn_pw_change"):
+            if not pw_now or not pw_new:
+                st.error("入力してください")
+            elif pw_new != pw_new2:
+                st.error("新しいパスワードが一致しません")
+            else:
+                df_u = load_users()
+                idx  = df_u[df_u["ID"] == st.session_state["user_id"]].index
+                if not idx.empty and df_u.loc[idx[0], "PW"] == pw_now:
+                    df_u.loc[idx[0], "PW"] = pw_new
+                    if save_users(df_u):
+                        st.success("パスワードを変更しました")
+                    else:
+                        st.error("保存に失敗しました")
+                else:
+                    st.error("現在のパスワードが違います")
+
+    # 管理者メニュー
+    if st.session_state["user_role"] == "管理者":
+        st.markdown("---")
+        st.markdown("### ⚙️ ユーザー管理")
+
+        df_u = load_users()
+
+        # ユーザー一覧
+        with st.expander("👥 ユーザー一覧"):
+            st.dataframe(df_u[["スタッフ名","ID","権限"]], use_container_width=True)
+
+        # ユーザー追加
+        with st.expander("➕ ユーザーを追加"):
+            new_name = st.text_input("スタッフ名", key="new_name")
+            new_id   = st.text_input("ID", key="new_id")
+            new_pw   = st.text_input("初期パスワード", key="new_pw")
+            new_role = st.selectbox("権限", ["一般", "管理者"], key="new_role")
+            if st.button("追加する", key="btn_add"):
+                if not new_name or not new_id or not new_pw:
+                    st.error("すべて入力してください")
+                elif new_id in df_u["ID"].values:
+                    st.error("このIDはすでに使われています")
+                else:
+                    new_row = pd.DataFrame([{"スタッフ名": new_name, "ID": new_id, "PW": new_pw, "権限": new_role}])
+                    df_u = pd.concat([df_u, new_row], ignore_index=True)
+                    if save_users(df_u):
+                        st.success(f"{new_name} さんを追加しました")
+                    else:
+                        st.error("保存に失敗しました")
+
+        # パスワードリセット
+        with st.expander("🔄 パスワードをリセット"):
+            reset_id = st.selectbox("対象ユーザー", df_u["ID"].tolist(), key="reset_id")
+            reset_pw = st.text_input("新しいパスワード", key="reset_pw")
+            if st.button("リセットする", key="btn_reset"):
+                if not reset_pw:
+                    st.error("新しいパスワードを入力してください")
+                else:
+                    idx = df_u[df_u["ID"] == reset_id].index
+                    df_u.loc[idx[0], "PW"] = reset_pw
+                    if save_users(df_u):
+                        st.success(f"{reset_id} のパスワードをリセットしました")
+                    else:
+                        st.error("保存に失敗しました")
+
+        # ユーザー削除
+        with st.expander("🗑️ ユーザーを削除"):
+            del_id = st.selectbox("削除するユーザー", df_u[df_u["ID"] != "admin"]["ID"].tolist(), key="del_id")
+            if st.button("削除する", key="btn_del"):
+                df_u = df_u[df_u["ID"] != del_id]
+                if save_users(df_u):
+                    st.success(f"{del_id} を削除しました")
+                else:
+                    st.error("保存に失敗しました")
+
+    st.markdown("---")
+    if st.button("🚪 ログアウト", use_container_width=True):
+        for key in ["logged_in","user_role","user_name","user_id"]:
+            st.session_state[key] = False if key == "logged_in" else ""
+        st.rerun()
 st.title("📅 シフト自動作成")
 st.write("希望休・夜勤ルール・役割条件を考慮して、最適なシフトを自動で作成します。")
 
