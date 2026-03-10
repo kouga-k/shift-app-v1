@@ -133,6 +133,7 @@ with st.sidebar:
                     df_u = pd.concat([df_u, new_row], ignore_index=True)
                     if save_users(df_u):
                         st.success(f"{new_name} さんを追加しました")
+                        st.rerun()
                     else:
                         st.error("保存に失敗しました")
 
@@ -148,6 +149,7 @@ with st.sidebar:
                     df_u.loc[idx[0], "pw"] = reset_pw
                     if save_users(df_u):
                         st.success(f"{reset_id} のパスワードをリセットしました")
+                        st.rerun()
                     else:
                         st.error("保存に失敗しました")
 
@@ -158,6 +160,7 @@ with st.sidebar:
                 df_u = df_u[df_u["id"] != del_id]
                 if save_users(df_u):
                     st.success(f"{del_id} を削除しました")
+                    st.rerun()
                 else:
                     st.error("保存に失敗しました")
 
@@ -167,7 +170,6 @@ with st.sidebar:
             st.session_state[key] = False if key == "logged_in" else ""
         st.rerun()
 st.title("📅 シフト自動作成")
-st.write("希望休・夜勤ルール・役割条件を考慮して、最適なシフトを自動で作成します。")
 
 if 'needs_compromise' not in st.session_state:
     st.session_state.needs_compromise = False
@@ -1202,8 +1204,8 @@ if uploaded_file:
         use_seeds = ALL_SEEDS[:num_patterns]
 
         if not st.session_state.needs_compromise:
-            if st.button(f"▶️ 【STEP 1】まずは妥協なしで理想のシフトを計算する（{num_patterns}パターン）"):
-                with st.spinner(f'AIが「妥協なし」の完璧なシフトを{num_patterns}パターン模索中...'):
+            if st.button(f"▶️ シフトを作成する（{num_patterns}パターン）"):
+                with st.spinner(f'シフトを計算中...（{num_patterns}パターン）'):
                     results = []
                     for seed in use_seeds:
                         solver, shifts = solve_shift(seed, False, False, False, False, False, False, False, True)
