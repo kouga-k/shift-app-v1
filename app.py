@@ -9,6 +9,7 @@ import calendar
 from openpyxl import Workbook
 from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
 from google.cloud import storage
+import extra_streamlit_components as stx
 
 # =============================================
 # ユーザー管理（Cloud Storage）
@@ -59,6 +60,20 @@ for key, val in [("logged_in", False), ("user_role", ""), ("user_name", ""), ("u
     if key not in st.session_state:
         st.session_state[key] = val
 
+# クッキーからログイン情報を復元
+cookie_manager = stx.CookieManager()
+cookies = cookie_manager.get_all()
+if not st.session_state["logged_in"]:
+    c_id   = cookies.get("shift_user_id", "")
+    c_pw   = cookies.get("shift_user_pw", "")
+    if c_id and c_pw:
+        role, name = check_login(c_id, c_pw)
+        if role:
+            st.session_state["logged_in"] = True
+            st.session_state["user_role"]  = role
+            st.session_state["user_name"]  = name
+            st.session_state["user_id"]    = c_id
+
 if not st.session_state["logged_in"]:
     st.title("🔐 ログイン")
     st.write("")
@@ -73,6 +88,9 @@ if not st.session_state["logged_in"]:
                 st.session_state["user_role"]  = role
                 st.session_state["user_name"]  = name
                 st.session_state["user_id"]    = user_id
+                # クッキーに保存（8時間）
+                cookie_manager.set("shift_user_id", user_id, expires_at=datetime.datetime.now() + datetime.timedelta(hours=8))
+                cookie_manager.set("shift_user_pw", password, expires_at=datetime.datetime.now() + datetime.timedelta(hours=8))
                 st.rerun()
             else:
                 st.error("IDまたはパスワードが違います")
@@ -166,6 +184,8 @@ with st.sidebar:
 
     st.markdown("---")
     if st.button("🚪 ログアウト", use_container_width=True):
+        cookie_manager.delete("shift_user_id")
+        cookie_manager.delete("shift_user_pw")
         for key in ["logged_in","user_role","user_name","user_id"]:
             st.session_state[key] = False if key == "logged_in" else ""
         st.rerun()
@@ -1619,9 +1639,18 @@ if uploaded_file:
                     st.caption("完成シフト・予定実績・年間管理がすべて1ファイルに含まれます。来月もこのファイルをアップロードしてください。")
 
                     # Excel用：列名を日付数字のみに変換（曜日は2行目に別途書き込む）
-                    cols_day   = [str(date_columns[d]) for d in range(num_days)]
-                    cols_label = ["スタッフ名"] + cols_day + ["日勤(A/P)回数", "残業(A残)回数", "夜勤(D)回数", "公休回数"]
-                    df_fin_xl  = df_fin.rename(columns=dict(zip(["スタッフ名"] + cols + ["日勤(A/P)回数","残業(A残)回数","夜勤(D)回数","公休回数"], cols_label)))
+                    cols_day   = []
+                    for d in range(num_days):
+                        try:
+                            cols_day.append(str(int(date_columns[d])))
+                        except Exception:
+                            cols_day.append(str(date_columns[d]))
+                    rename_map = {"スタッフ名": "スタッフ名"}
+                    for orig, new_c in zip(cols, cols_day):
+                        rename_map[orig] = new_c
+                    for c in ["日勤(A/P)回数","残業(A残)回数","夜勤(D)回数","公休回数"]:
+                        rename_map[c] = c
+                    df_fin_xl = df_fin.rename(columns=rename_map)
 
                     output = io.BytesIO()
                     with pd.ExcelWriter(output, engine='openpyxl') as writer:
@@ -1635,7 +1664,10 @@ if uploaded_file:
                         worksheet.cell(row=2, column=1).value = ""
                         for d, col_name in enumerate(cols):
                             wday = weekdays[d]
-                            is_hol = jpholiday.is_holiday(datetime.date(target_year, target_month, int(date_columns[d]))) if str(date_columns[d]).isdigit() else False
+                            try:
+                                is_hol = jpholiday.is_holiday(datetime.date(target_year, target_month, int(date_columns[d])))
+                            except Exception:
+                                is_hol = False
                             label = "祝" if is_hol else wday
                             c = worksheet.cell(row=2, column=d + 2)
                             c.value = label
