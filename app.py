@@ -25,9 +25,12 @@ def load_users():
         data   = blob.download_as_text(encoding="utf-8-sig")
         from io import StringIO
         df = pd.read_csv(StringIO(data), dtype=str).fillna("")
+        # 列名を統一
+        col_map = {"スタッフ名":"name","ID":"id","PW":"pw","権限":"role"}
+        df = df.rename(columns=col_map)
         return df
     except Exception:
-        return pd.DataFrame(columns=["スタッフ名","ID","PW","権限"])
+        return pd.DataFrame(columns=["name","id","pw","role"])
 
 def save_users(df):
     """ユーザーCSVをCloud Storageに保存"""
@@ -42,9 +45,9 @@ def save_users(df):
 
 def check_login(user_id, password):
     df = load_users()
-    row = df[(df["ID"] == user_id) & (df["PW"] == password)]
+    row = df[(df["id"] == user_id) & (df["pw"] == password)]
     if not row.empty:
-        return row.iloc[0]["権限"], row.iloc[0]["スタッフ名"]
+        return row.iloc[0]["role"], row.iloc[0]["name"]
     return None, None
 
 # =============================================
@@ -93,9 +96,9 @@ with st.sidebar:
                 st.error("新しいパスワードが一致しません")
             else:
                 df_u = load_users()
-                idx  = df_u[df_u["ID"] == st.session_state["user_id"]].index
-                if not idx.empty and df_u.loc[idx[0], "PW"] == pw_now:
-                    df_u.loc[idx[0], "PW"] = pw_new
+                idx  = df_u[df_u["id"] == st.session_state["user_id"]].index
+                if not idx.empty and df_u.loc[idx[0], "pw"] == pw_now:
+                    df_u.loc[idx[0], "pw"] = pw_new
                     if save_users(df_u):
                         st.success("パスワードを変更しました")
                     else:
@@ -112,7 +115,7 @@ with st.sidebar:
 
         # ユーザー一覧
         with st.expander("👥 ユーザー一覧"):
-            st.dataframe(df_u[["スタッフ名","ID","権限"]], use_container_width=True)
+            st.dataframe(df_u[["name","id","role"]], use_container_width=True)
 
         # ユーザー追加
         with st.expander("➕ ユーザーを追加"):
@@ -123,10 +126,10 @@ with st.sidebar:
             if st.button("追加する", key="btn_add"):
                 if not new_name or not new_id or not new_pw:
                     st.error("すべて入力してください")
-                elif new_id in df_u["ID"].values:
+                elif new_id in df_u["id"].values:
                     st.error("このIDはすでに使われています")
                 else:
-                    new_row = pd.DataFrame([{"スタッフ名": new_name, "ID": new_id, "PW": new_pw, "権限": new_role}])
+                    new_row = pd.DataFrame([{"name": new_name, "id": new_id, "pw": new_pw, "role": new_role}])
                     df_u = pd.concat([df_u, new_row], ignore_index=True)
                     if save_users(df_u):
                         st.success(f"{new_name} さんを追加しました")
@@ -135,14 +138,14 @@ with st.sidebar:
 
         # パスワードリセット
         with st.expander("🔄 パスワードをリセット"):
-            reset_id = st.selectbox("対象ユーザー", df_u["ID"].tolist(), key="reset_id")
+            reset_id = st.selectbox("対象ユーザー", df_u["id"].tolist(), key="reset_id")
             reset_pw = st.text_input("新しいパスワード", key="reset_pw")
             if st.button("リセットする", key="btn_reset"):
                 if not reset_pw:
                     st.error("新しいパスワードを入力してください")
                 else:
-                    idx = df_u[df_u["ID"] == reset_id].index
-                    df_u.loc[idx[0], "PW"] = reset_pw
+                    idx = df_u[df_u["id"] == reset_id].index
+                    df_u.loc[idx[0], "pw"] = reset_pw
                     if save_users(df_u):
                         st.success(f"{reset_id} のパスワードをリセットしました")
                     else:
@@ -150,9 +153,9 @@ with st.sidebar:
 
         # ユーザー削除
         with st.expander("🗑️ ユーザーを削除"):
-            del_id = st.selectbox("削除するユーザー", df_u[df_u["ID"] != "admin"]["ID"].tolist(), key="del_id")
+            del_id = st.selectbox("削除するユーザー", df_u[df_u["id"] != "admin"]["id"].tolist(), key="del_id")
             if st.button("削除する", key="btn_del"):
-                df_u = df_u[df_u["ID"] != del_id]
+                df_u = df_u[df_u["id"] != del_id]
                 if save_users(df_u):
                     st.success(f"{del_id} を削除しました")
                 else:
