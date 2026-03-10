@@ -942,7 +942,10 @@ if uploaded_file:
                 is_abs = (absolute_req_list[d] == "〇")
                 if is_abs:
                     model.Add(act_day >= req)
-                    if not allow_abs_plus_1:
+                    if is_sun:
+                        # 日曜の絶対確保日も超過しない（設定人数ちょうど）
+                        model.Add(act_day <= req)
+                    elif not allow_abs_plus_1:
                         over_var = model.NewIntVar(0, 100, ''); diff = model.NewIntVar(-100, 100, '')
                         model.Add(diff == act_day - req); model.AddMaxEquality(over_var, [0, diff])
                         penalties.append(over_var * 1)
@@ -993,6 +996,13 @@ if uploaded_file:
             for e in range(num_staff):
                 model.Add(sum(shifts[(e, d, '公')] for d in range(num_days)) == int(staff_off_days[e]))
                 if staff_night_ok[e] != "×": model.Add(sum(shifts[(e, d, 'D')] for d in range(num_days)) <= int(staff_night_limits[e]))
+
+            # 研修中スタッフが同じ日に残業(A残)にならないよう制約
+            # 残業必要人数が2以上の日でも研修中は1人まで
+            training_staff = [e for e in range(num_staff) if "研修" in str(staff_roles[e])]
+            if len(training_staff) >= 2:
+                for d in range(num_days):
+                    model.Add(sum(shifts[(e, d, 'A残')] for e in training_staff) <= 1)
 
             limit_groups = {}
             for e in range(num_staff):
