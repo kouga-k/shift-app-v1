@@ -26,7 +26,6 @@ def load_users():
         data   = blob.download_as_text(encoding="utf-8-sig")
         from io import StringIO
         df = pd.read_csv(StringIO(data), dtype=str).fillna("")
-        # 列名を統一
         col_map = {"スタッフ名":"name","ID":"id","PW":"pw","権限":"role"}
         df = df.rename(columns=col_map)
         return df
@@ -56,7 +55,20 @@ def check_login(user_id, password):
 # =============================================
 st.set_page_config(page_title="自動シフト作成アプリ", layout="wide")
 
-for key, val in [("logged_in", False), ("user_role", ""), ("user_name", ""), ("user_id", "")]:
+# ── [修正⑮] セッション状態をまとめて初期化 ──
+SESSION_DEFAULTS = {
+    "logged_in": False,
+    "user_role": "",
+    "user_name": "",
+    "user_id": "",
+    "needs_compromise": False,
+    "min_compromise_result": None,
+    "step3_failed": False,
+    "card_selections": {},
+    # [修正⑮] results をセッションで管理
+    "shift_results": [],
+}
+for key, val in SESSION_DEFAULTS.items():
     if key not in st.session_state:
         st.session_state[key] = val
 
@@ -88,7 +100,6 @@ if not st.session_state["logged_in"]:
                 st.session_state["user_role"]  = role
                 st.session_state["user_name"]  = name
                 st.session_state["user_id"]    = user_id
-                # クッキーに保存（8時間）
                 cookie_manager.set("shift_user_id", user_id, expires_at=datetime.datetime.now() + datetime.timedelta(hours=8))
                 cookie_manager.set("shift_user_pw", password, expires_at=datetime.datetime.now() + datetime.timedelta(hours=8))
                 st.rerun()
@@ -102,7 +113,6 @@ with st.sidebar:
     st.caption(f"権限：{st.session_state['user_role']}")
     st.markdown("---")
 
-    # 自分のパスワード変更
     with st.expander("🔑 パスワードを変更する"):
         pw_now  = st.text_input("現在のパスワード", type="password", key="pw_now")
         pw_new  = st.text_input("新しいパスワード", type="password", key="pw_new")
@@ -124,18 +134,14 @@ with st.sidebar:
                 else:
                     st.error("現在のパスワードが違います")
 
-    # 管理者メニュー
     if st.session_state["user_role"] == "管理者":
         st.markdown("---")
         st.markdown("### ⚙️ ユーザー管理")
-
         df_u = load_users()
 
-        # ユーザー一覧
         with st.expander("👥 ユーザー一覧"):
             st.dataframe(df_u[["name","id","role"]], use_container_width=True)
 
-        # ユーザー追加
         with st.expander("➕ ユーザーを追加"):
             new_name = st.text_input("スタッフ名", key="new_name")
             new_id   = st.text_input("ID", key="new_id")
@@ -155,7 +161,6 @@ with st.sidebar:
                     else:
                         st.error("保存に失敗しました")
 
-        # パスワードリセット
         with st.expander("🔄 パスワードをリセット"):
             reset_id = st.selectbox("対象ユーザー", df_u["id"].tolist(), key="reset_id")
             reset_pw = st.text_input("新しいパスワード", key="reset_pw")
@@ -171,7 +176,6 @@ with st.sidebar:
                     else:
                         st.error("保存に失敗しました")
 
-        # ユーザー削除
         with st.expander("🗑️ ユーザーを削除"):
             del_id = st.selectbox("削除するユーザー", df_u[df_u["id"] != "admin"]["id"].tolist(), key="del_id")
             if st.button("削除する", key="btn_del"):
@@ -189,11 +193,8 @@ with st.sidebar:
         for key in ["logged_in","user_role","user_name","user_id"]:
             st.session_state[key] = False if key == "logged_in" else ""
         st.rerun()
+
 st.title("📅 シフト自動作成")
-
-if 'needs_compromise' not in st.session_state:
-    st.session_state.needs_compromise = False
-
 st.write("---")
 today = datetime.date.today()
 col_y, col_m = st.columns(2)
@@ -224,40 +225,36 @@ if uploaded_file:
 
         staff_roles = get_staff_col("役割", "一般")
 
-        # ── 公休数：週休2日制 → 2月=8日、それ以外=9日を自動設定（手入力が優先）──
         _auto_off = 8 if target_month == 2 else 9
         staff_off_days = get_staff_col("公休数", _auto_off, is_int=True)
         staff_night_ok = get_staff_col("夜勤可否", "〇")
         staff_overtime_ok = get_staff_col("残業可否", "〇")
+        # 残業不可曜日：「月水金」のように続けて記入。空欄は制限なし
+        staff_ot_ng_weekdays = get_staff_col("残業不可曜日", "")
         staff_part_shifts = get_staff_col("パート", "")
         staff_night_limits = [0 if ok == "×" else int(v) if pd.notna(v) else 10 for ok, v in zip(staff_night_ok, get_staff_col("夜勤上限", 10, is_int=True))]
         staff_min_normal_a = get_staff_col("定時確保数", 2, is_int=True)
         staff_sun_d = ["×" if ok == "×" else v for ok, v in zip(staff_night_ok, get_staff_col("日曜Dカウント", "〇"))]
         staff_sun_e = ["×" if ok == "×" else v for ok, v in zip(staff_night_ok, get_staff_col("日曜Eカウント", "〇"))]
 
-        # 有休・夏冬休関連
-        staff_join_month   = get_staff_col("入職月", 0, is_int=True)          # 入職月（1〜12）
-        staff_paid_given   = get_staff_col("有休付与日数", 10, is_int=True)    # 今年度付与日数
-        staff_paid_taken   = get_staff_col("有休取得済", 0, is_int=True)       # 今年度取得済累計
-        staff_summer_given = get_staff_col("夏季休暇付与", 3, is_int=True)     # 夏休付与日数（7〜9月で3日）
-        staff_summer_taken = get_staff_col("夏季休暇取得済", 0, is_int=True)   # 夏休取得済
-        staff_winter_given = get_staff_col("冬季休暇付与", 4, is_int=True)     # 冬休付与日数（12〜2月で4日）
-        staff_winter_taken = get_staff_col("冬季休暇取得済", 0, is_int=True)   # 冬休取得済
+        staff_join_month   = get_staff_col("入職月", 0, is_int=True)
+        staff_paid_given   = get_staff_col("有休付与日数", 10, is_int=True)
+        staff_paid_taken   = get_staff_col("有休取得済", 0, is_int=True)
+        staff_summer_given = get_staff_col("夏季休暇付与", 3, is_int=True)
+        staff_summer_taken = get_staff_col("夏季休暇取得済", 0, is_int=True)
+        staff_winter_given = get_staff_col("冬季休暇付与", 4, is_int=True)
+        staff_winter_taken = get_staff_col("冬季休暇取得済", 0, is_int=True)
 
-        # 休暇優先順位ルール
-        # 公休(9日) ＞ 夏冬休 ＞ 年休
-        # 夏休：7〜9月に3日、冬休：12〜2月に4日
         SUMMER_MONTHS = [7, 8, 9]
         WINTER_MONTHS = [12, 1, 2]
         SUMMER_TARGET = 3
         WINTER_TARGET = 4
 
-        # 入職月別 義務取得日数テーブル（画像より）
         PAID_OBLIGATION_TABLE = {
             4: 2.5, 5: 2.5, 6: 2.0, 7: 1.5, 8: 1.0, 9: 0.5,
             10: 5.0, 11: 5.0, 12: 4.5, 1: 4.0, 2: 3.5, 3: 3.0
         }
-        # 入職月 → 最初の有休付与月（入職6ヶ月後）
+
         def get_grant_month(join_month):
             if join_month == 0: return 0
             return ((join_month - 1 + 6) % 12) + 1
@@ -308,7 +305,7 @@ if uploaded_file:
                 weekdays.append("")
 
         # =============================================
-        # 希望休情報を事前集計（カード生成・診断で共用）
+        # 希望休情報を事前集計
         # =============================================
         def build_fixed_off_info():
             fixed_off = [0] * num_staff
@@ -329,12 +326,24 @@ if uploaded_file:
         fixed_off, fixed_off_days_list, fixed_off_per_day = build_fixed_off_info()
 
         # =============================================
-        # 📊 年間管理シート読み込み
+        # 残業不可日を集計（曜日指定のみ）
+        # =============================================
+        # ot_ng_days_list[e] = そのスタッフが残業不可の日インデックスのリスト
+        # ※日付指定は希望休シートに「A」を書けば同等の効果があるため不要
+        ot_ng_days_list = [[] for _ in range(num_staff)]
+        for e in range(num_staff):
+            ng_wdays = str(staff_ot_ng_weekdays[e]).strip()
+            if ng_wdays:
+                for d in range(num_days):
+                    if weekdays[d] in ng_wdays:
+                        ot_ng_days_list[e].append(d)
+
+        # =============================================
+        # 年間管理シート読み込み
         # =============================================
         try:
             df_annual = pd.read_excel(uploaded_file, sheet_name="年間管理")
         except Exception:
-            # 年間管理シートがない場合は空のDataFrameを作成
             df_annual = pd.DataFrame(columns=[
                 "スタッフ名", "入職月", "有休付与日数", "有休取得済(累計)", "有休残日数",
                 "義務取得日数", "義務残日数", "夏季付与", "夏季取得済", "冬季付与", "冬季取得済",
@@ -342,7 +351,6 @@ if uploaded_file:
             ])
 
         def get_annual_val(name, col, default=0):
-            """年間管理シートから特定スタッフの値を取得"""
             if df_annual.empty or col not in df_annual.columns:
                 return default
             row = df_annual[df_annual["スタッフ名"] == name]
@@ -353,59 +361,40 @@ if uploaded_file:
             except Exception:
                 return default
 
-        # 前月の公休実績（年間管理シートから）→ 繰り越しチェック用
         staff_prev_off_actual = []
         for e in range(num_staff):
             val = get_annual_val(staff_names[e], "前月公休実績", _auto_off)
             staff_prev_off_actual.append(int(val))
 
         # =============================================
-        # 📊 振り返りレポート生成関数
+        # 振り返りレポート生成
         # =============================================
-        # 有休年度ルール：4月〜2月の間に年5日取得。3月は未取得分を強制消化。
-        # 現在が何月かで「残り取得可能月数」と「必要ペース」を計算する。
-        PAID_YEAR_TARGET = 5          # 年間義務取得日数
-        # 4月=1ヶ月目、5月=2ヶ月目…2月=11ヶ月目、3月は強制消化月
+        PAID_YEAR_TARGET = 5
+
         def months_in_period(m):
-            """4月を起点にした経過月数（4月=1, 5月=2, …, 2月=11, 3月=12）"""
             return ((m - 4) % 12) + 1
 
         def remaining_months_to_feb(m):
-            """現在月から2月末までの残り月数（3月シフト作成時は0）"""
             if m == 3: return 0
             period = months_in_period(m)
-            return 11 - period  # 11ヶ月目(2月)まであと何ヶ月
+            return 11 - period
 
         def build_review_report(df_fin, cols):
-            """
-            完成シフトdf_finから今月実績を集計し、以下を返す：
-            ・有休：4〜2月で年5日取得の月別ペース促し
-            ・夏休：7〜9月で3日取得促し
-            ・冬休：12〜2月で4日取得促し
-            ・公休：8日だった翌月は10日繰り越し警告
-            ・優先順位：公休 ＞ 夏冬休 ＞ 年休
-            """
             report_rows = []
-            alerts       = []   # 黄色警告
-            red_alerts   = []   # 赤色強制対応
-            march_forced = []   # 3月強制消化
+            alerts       = []
+            red_alerts   = []
+            march_forced = []
 
             remain_months = remaining_months_to_feb(target_month)
             is_march = (target_month == 3)
 
-            # 今月の公休実績（シフト表から集計）→ 来月繰り越し判定用
-            off_actual_this = {}
-
             for e in range(num_staff):
                 name = staff_names[e]
 
-                # ── 今月実績 ──
                 night_this  = int(df_fin.loc[e, "夜勤(D)回数"]) if "夜勤(D)回数" in df_fin.columns else 0
                 ot_this     = int(df_fin.loc[e, "残業(A残)回数"]) if "残業(A残)回数" in df_fin.columns else 0
                 off_this    = int(df_fin.loc[e, "公休回数"]) if "公休回数" in df_fin.columns else _auto_off
-                off_actual_this[name] = off_this
 
-                # 連勤最大日数
                 max_consec = 0; cur = 0
                 for d in range(num_days):
                     v = str(df_fin.loc[e, cols[d]]) if d < len(cols) else ""
@@ -414,78 +403,57 @@ if uploaded_file:
                     else:
                         cur = 0
 
-                # ── 年間累計 ──
                 night_cum       = int(get_annual_val(name, "夜勤累計", 0)) + night_this
                 ot_cum          = int(get_annual_val(name, "残業累計", 0)) + ot_this
                 max_consec_past = int(get_annual_val(name, "連勤最大(過去最高)", 0))
                 max_consec_all  = max(max_consec_past, max_consec)
 
-                # ────────────────────────────────────────
-                # ① 公休チェック（最優先）
-                # ────────────────────────────────────────
-                prev_off = staff_prev_off_actual[e]   # 前月公休実績
+                prev_off = staff_prev_off_actual[e]
                 carryover_needed = 0
                 off_judgement = []
 
                 if prev_off < 9:
                     shortage = 9 - prev_off
-                    carryover_needed = 9 + shortage  # 来月は9+不足分
+                    carryover_needed = 9 + shortage
                     off_judgement.append(f"⚠️ 前月公休{prev_off}日→今月{carryover_needed}日繰越必要")
                     alerts.append(
                         f"**{name}**：前月の公休が **{prev_off}日** でした（基準9日）。"
                         f"今月は **{carryover_needed}日** の公休が必要です。"
-                        f"※公休不足は緊急時のみ。しっかり休養するよう声がけを。"
                     )
                 if off_this < 9 and off_this > 0:
                     off_judgement.append(f"🟡 今月公休{off_this}日（基準9日）")
                     alerts.append(
                         f"**{name}**：今月の公休が **{off_this}日** です。"
-                        f"週休2日制のため基準は9日です。緊急時以外はしっかり休養させてください。"
-                        f"（来月は繰り越し{9+(9-off_this)}日が必要になります）"
+                        f"基準は9日です。（来月は繰り越し{9+(9-off_this)}日が必要になります）"
                     )
 
-                # ────────────────────────────────────────
-                # ② 夏季休暇チェック（7〜9月）
-                # ────────────────────────────────────────
                 sum_given  = int(get_annual_val(name, "夏季付与", SUMMER_TARGET))
                 sum_taken  = int(get_annual_val(name, "夏季取得済", staff_summer_taken[e]))
                 sum_remain = max(0, sum_given - sum_taken)
                 sum_judgement = []
 
                 if target_month in SUMMER_MONTHS:
-                    # 夏休期間中
-                    months_left_summer = SUMMER_MONTHS[-1] - target_month  # 9月まであと何ヶ月
+                    if target_month == 12: months_left_summer = 0
+                    else: months_left_summer = SUMMER_MONTHS[-1] - target_month
                     if sum_remain > 0:
                         if months_left_summer == 0:
-                            # 9月末が最後のチャンス
                             sum_judgement.append(f"🔴 夏休{sum_remain}日未取得（今月が最終）")
-                            red_alerts.append(
-                                f"**{name}**：夏季休暇が **{sum_remain}日** 未取得です。"
-                                f"9月が最終月のため、今月のシフトに必ず組み込んでください。"
-                            )
+                            red_alerts.append(f"**{name}**：夏季休暇が **{sum_remain}日** 未取得です。9月が最終月です。")
                         else:
                             sum_judgement.append(f"🟡 夏休残{sum_remain}日（残{months_left_summer}ヶ月）")
-                            alerts.append(
-                                f"**{name}**：夏季休暇が残 **{sum_remain}日** です。"
-                                f"9月末までに取得してください（残{months_left_summer}ヶ月）。"
-                            )
+                            alerts.append(f"**{name}**：夏季休暇が残 **{sum_remain}日** です。9月末までに取得してください。")
                     else:
                         sum_judgement.append("🟢 夏休取得完了")
                 elif target_month > 9:
                     if sum_remain > 0:
                         sum_judgement.append(f"⚠️ 夏休{sum_remain}日未消化（期間外）")
 
-                # ────────────────────────────────────────
-                # ③ 冬季休暇チェック（12〜2月）
-                # ────────────────────────────────────────
                 win_given  = int(get_annual_val(name, "冬季付与", WINTER_TARGET))
                 win_taken  = int(get_annual_val(name, "冬季取得済", staff_winter_taken[e]))
                 win_remain = max(0, win_given - win_taken)
                 win_judgement = []
 
                 if target_month in WINTER_MONTHS:
-                    # 冬休期間中：12月=残2ヶ月、1月=残1ヶ月、2月=最終
-                    months_left_winter = (2 - target_month) % 12  # 2月まであと何ヶ月（12月→2, 1月→1, 2月→0）
                     if target_month == 12: months_left_winter = 2
                     elif target_month == 1: months_left_winter = 1
                     else: months_left_winter = 0
@@ -493,25 +461,16 @@ if uploaded_file:
                     if win_remain > 0:
                         if months_left_winter == 0:
                             win_judgement.append(f"🔴 冬休{win_remain}日未取得（今月が最終）")
-                            red_alerts.append(
-                                f"**{name}**：冬季休暇が **{win_remain}日** 未取得です。"
-                                f"2月が最終月のため、今月のシフトに必ず組み込んでください。"
-                            )
+                            red_alerts.append(f"**{name}**：冬季休暇が **{win_remain}日** 未取得です。2月が最終月です。")
                         else:
                             win_judgement.append(f"🟡 冬休残{win_remain}日（残{months_left_winter}ヶ月）")
-                            alerts.append(
-                                f"**{name}**：冬季休暇が残 **{win_remain}日** です。"
-                                f"2月末までに取得してください（残{months_left_winter}ヶ月）。"
-                            )
+                            alerts.append(f"**{name}**：冬季休暇が残 **{win_remain}日** です。2月末までに取得してください。")
                     else:
                         win_judgement.append("🟢 冬休取得完了")
                 elif target_month > 2 and target_month < 12:
                     if win_remain > 0:
                         win_judgement.append(f"⚠️ 冬休{win_remain}日未消化")
 
-                # ────────────────────────────────────────
-                # ④ 有休チェック（4〜2月 年5日）※最低優先
-                # ────────────────────────────────────────
                 paid_given       = int(get_annual_val(name, "有休付与日数", staff_paid_given[e]))
                 paid_taken_total = float(get_annual_val(name, "有休取得済(累計)", staff_paid_taken[e]))
                 paid_remain      = max(0.0, paid_given - paid_taken_total)
@@ -525,10 +484,7 @@ if uploaded_file:
 
                 if is_march and year_short > 0:
                     paid_judgement.append(f"🔴 3月強制消化{year_short}日")
-                    red_alerts.append(
-                        f"**{name}**：年間有休5日に対し **{year_short}日** 未達です。"
-                        f"3月シフトに必ず有休を組み込んでください。"
-                    )
+                    red_alerts.append(f"**{name}**：年間有休5日に対し **{year_short}日** 未達です。3月シフトに必ず有休を組み込んでください。")
                     march_forced.append({"name": name, "days": year_short})
                 elif not is_march:
                     period_elapsed   = months_in_period(target_month)
@@ -543,18 +499,13 @@ if uploaded_file:
                         paid_judgement.append("🎉 有休5日達成")
                     elif paid_taken_total < expected_by_now - 1:
                         paid_judgement.append(f"🟡 有休ペース遅れ（{pace_msg}）")
-                        alerts.append(
-                            f"**{name}**：有休取得が遅れています。{pace_msg}。"
-                            f"このまま進むと2月末に義務未達になる恐れがあります。"
-                            f"公休・夏冬休の後に有休を計画的に配置してください。"
-                        )
+                        alerts.append(f"**{name}**：有休取得が遅れています。{pace_msg}。")
                     else:
                         paid_judgement.append(f"🟢 有休進行中（{pace_msg}）")
 
                 if first_year_short > 0 and join_m != 0:
                     paid_judgement.append(f"⚠️ 初年度義務残{first_year_short}日")
 
-                # ── 全判定まとめ ──
                 judgements = off_judgement + sum_judgement + win_judgement + paid_judgement
                 if max_consec >= 4:
                     judgements.append(f"⚠️ 最大{max_consec}連勤")
@@ -576,7 +527,6 @@ if uploaded_file:
                     "夏休残":         sum_remain,
                     "冬休残":         win_remain,
                     "判定":           " / ".join(judgements),
-                    # 年間管理更新用
                     "_night_cum":     night_cum,
                     "_ot_cum":        ot_cum,
                     "_max_consec":    max_consec_all,
@@ -594,9 +544,7 @@ if uploaded_file:
             df_report = pd.DataFrame(report_rows)
             return df_report, alerts, red_alerts, march_forced
 
-
         def build_annual_excel(df_report):
-            """振り返りレポートをもとに年間管理シートを更新したExcelを返す"""
             update_month = f"{target_year}/{target_month:02d}"
             rows = []
             for _, r in df_report.iterrows():
@@ -614,18 +562,12 @@ if uploaded_file:
                     "夜勤累計":             r["_night_cum"],
                     "残業累計":             r["_ot_cum"],
                     "連勤最大(過去最高)":    r["_max_consec"],
-                    "前月公休実績":          r["_off_this"],   # ← 来月の繰り越しチェック用
+                    "前月公休実績":          r["_off_this"],
                     "最終更新":              update_month,
                 })
             return pd.DataFrame(rows)
 
-
-
-
         def generate_compromise_cards(necessary):
-            """
-            必要な妥協案ごとに「誰が・何日・なぜ」を具体的に示すカードを生成する。
-            """
             cards = []
 
             # ── カード0：平日・祝の日勤人数を-1 ──
@@ -633,8 +575,7 @@ if uploaded_file:
                 short_days = []
                 for d in range(num_days):
                     if '日' not in weekdays[d] and '土' not in weekdays[d]:
-                        blocked = len(fixed_off_days_list[e] for e in range(num_staff) if d in fixed_off_days_list[e])
-                        # ブロック人数を正しく計算
+                        # [修正①] len(generator) → sum() で正しくカウント
                         blocked_count = sum(1 for e in range(num_staff) if d in fixed_off_days_list[e])
                         night_use = night_req_list[d]
                         e_use = night_req_list[d - 1] if d > 0 else 0
@@ -662,7 +603,7 @@ if uploaded_file:
                 comp_staff = [staff_names[e] for e in range(num_staff) if staff_comp_lvl[e] > 0]
                 if comp_staff:
                     names_str = "・".join(comp_staff)
-                    detail = f"**{names_str}** さんに、月内で最大4日連続勤務をお願いする可能性があります（妥協優先度が設定されているスタッフのみ対象）。"
+                    detail = f"**{names_str}** さんに、月内で最大4日連続勤務をお願いする可能性があります。"
                 else:
                     detail = "妥協優先度が設定されたスタッフに、4日連続勤務を許容します。"
                 cards.append({
@@ -681,7 +622,7 @@ if uploaded_file:
                 comp_night_staff = [staff_names[e] for e in range(num_staff) if staff_comp_lvl[e] > 0 and staff_night_ok[e] != "×"]
                 if comp_night_staff:
                     names_str = "・".join(comp_night_staff)
-                    detail = f"**{names_str}** さんに、夜勤(D)の直前3日間を連続日勤にする場合があります。通常は夜勤前の連勤数を制限していますが、この制限を一部緩和します。"
+                    detail = f"**{names_str}** さんに、夜勤(D)の直前3日間を連続日勤にする場合があります。"
                 else:
                     detail = "妥協優先度が設定された夜勤可能スタッフに、夜勤直前の3連勤を許容します。"
                 cards.append({
@@ -699,7 +640,6 @@ if uploaded_file:
             if necessary[3]:
                 leader_staff = [staff_names[e] for e in range(num_staff) if "主任" in str(staff_roles[e]) or "リーダー" in str(staff_roles[e])]
                 sub_staff = [staff_names[e] for e in range(num_staff) if "サブ" in str(staff_roles[e])]
-                # リーダーが不在になりそうな日を特定
                 risky_days = []
                 for d in range(num_days):
                     leader_blocked = sum(1 for e in range(num_staff)
@@ -730,7 +670,6 @@ if uploaded_file:
             if necessary[4]:
                 ot_staff = [staff_names[e] for e in range(num_staff) if staff_overtime_ok[e] != "×"]
                 names_str = "・".join(ot_staff) if ot_staff else "残業可能スタッフ"
-                # 残業が必要な日を特定
                 ot_days = [f"{date_columns[d]}日({weekdays[d]})" for d in range(num_days) if overtime_req_list[d] > 0]
                 if ot_days:
                     days_str = "・".join(ot_days[:4]) + ("など" if len(ot_days) > 4 else "")
@@ -897,6 +836,19 @@ if uploaded_file:
                         model.Add(shifts[(e, d, 'D')] == 0); model.Add(shifts[(e, d, 'E')] == 0)
                 if staff_overtime_ok[e] == "×":
                     for d in range(num_days): model.Add(shifts[(e, d, 'A残')] == 0)
+                # 新人は役割名で強制禁止（設定ミスを回避）
+                role_str = str(staff_roles[e])
+                if "新人" in role_str:
+                    for d in range(num_days):
+                        model.Add(shifts[(e, d, 'D')] == 0)
+                        model.Add(shifts[(e, d, 'E')] == 0)
+                        model.Add(shifts[(e, d, 'A残')] == 0)
+                # パート欄に値があるスタッフも夜勤・残業禁止
+                if str(staff_part_shifts[e]).strip() not in ["", "nan"]:
+                    for d in range(num_days):
+                        model.Add(shifts[(e, d, 'D')] == 0)
+                        model.Add(shifts[(e, d, 'E')] == 0)
+                        model.Add(shifts[(e, d, 'A残')] == 0)
 
             for e, staff_name in enumerate(staff_names):
                 tr = df_history[df_history.iloc[:, 0] == staff_name]
@@ -956,14 +908,18 @@ if uploaded_file:
             for d in range(num_days):
                 model.Add(sum(shifts[(e, d, 'D')] for e in range(num_staff)) == night_req_list[d])
                 model.Add(sum(shifts[(e, d, 'A残')] for e in range(num_staff)) == overtime_req_list[d])
-                act_day = sum((shifts[(e, d, 'A')] + shifts[(e, d, 'A残')]) for e in range(num_staff) if "新人" not in str(staff_roles[e]))
+                # [修正④] 演算子優先度バグを修正（括弧追加）
+                act_day = sum(
+                    (shifts[(e, d, 'A')] + shifts[(e, d, 'A残')])
+                    for e in range(num_staff)
+                    if "新人" not in str(staff_roles[e])
+                )
                 req = day_req_list[d]
                 is_sun = ('日' in weekdays[d])
                 is_abs = (absolute_req_list[d] == "〇")
                 if is_abs:
                     model.Add(act_day >= req)
                     if is_sun:
-                        # 日曜の絶対確保日も超過しない（設定人数ちょうど）
                         model.Add(act_day <= req)
                     elif not allow_abs_plus_1:
                         over_var = model.NewIntVar(0, 100, ''); diff = model.NewIntVar(-100, 100, '')
@@ -978,7 +934,11 @@ if uploaded_file:
                     if not allow_sun_minus_1:
                         model.Add(act_day == req)
                     else:
-                        leader_present = sum((1 if "主任" in str(staff_roles[e]) or "リーダー" in str(staff_roles[e]) else 0) * (shifts[(e, d, 'A')] + shifts[(e, d, 'A残')]) for e in range(num_staff))
+                        leader_present = sum(
+                            (1 if "主任" in str(staff_roles[e]) or "リーダー" in str(staff_roles[e]) else 0)
+                            * (shifts[(e, d, 'A')] + shifts[(e, d, 'A残')])
+                            for e in range(num_staff)
+                        )
                         has_leader = model.NewBoolVar('')
                         model.Add(leader_present >= 1).OnlyEnforceIf(has_leader)
                         model.Add(leader_present == 0).OnlyEnforceIf(has_leader.Not())
@@ -998,7 +958,11 @@ if uploaded_file:
                     model.Add(diff == act_day - req); model.AddMaxEquality(over_var, [0, diff])
                     penalties.append(over_var * 100)
 
-                l_score = sum((2 if "主任" in str(staff_roles[e]) or "リーダー" in str(staff_roles[e]) else 1 if "サブ" in str(staff_roles[e]) else 0) * (shifts[(e, d, 'A')] + shifts[(e, d, 'A残')]) for e in range(num_staff))
+                l_score = sum(
+                    (2 if "主任" in str(staff_roles[e]) or "リーダー" in str(staff_roles[e]) else 1 if "サブ" in str(staff_roles[e]) else 0)
+                    * (shifts[(e, d, 'A')] + shifts[(e, d, 'A残')])
+                    for e in range(num_staff)
+                )
                 if not allow_sub_only: model.Add(l_score >= 2)
                 else:
                     model.Add(l_score >= 1); sub_var = model.NewBoolVar('')
@@ -1017,8 +981,12 @@ if uploaded_file:
                 model.Add(sum(shifts[(e, d, '公')] for d in range(num_days)) == int(staff_off_days[e]))
                 if staff_night_ok[e] != "×": model.Add(sum(shifts[(e, d, 'D')] for d in range(num_days)) <= int(staff_night_limits[e]))
 
-            # 研修中スタッフが同じ日に残業(A残)にならないよう制約
-            # 残業必要人数が2以上の日でも研修中は1人まで
+            # 残業不可日（日付指定＋曜日指定）の制約
+            for e in range(num_staff):
+                for d in ot_ng_days_list[e]:
+                    if d < num_days:
+                        model.Add(shifts[(e, d, 'A残')] == 0)
+
             training_staff = [e for e in range(num_staff) if "研修" in str(staff_roles[e])]
             if len(training_staff) >= 2:
                 for d in range(num_days):
@@ -1133,6 +1101,19 @@ if uploaded_file:
                     for d in range(num_days): _model.Add(_shifts[(e, d, 'D')] == 0); _model.Add(_shifts[(e, d, 'E')] == 0)
                 if staff_overtime_ok[e] == "×":
                     for d in range(num_days): _model.Add(_shifts[(e, d, 'A残')] == 0)
+                # 新人は役割名で強制禁止（設定ミスを回避）
+                role_str = str(staff_roles[e])
+                if "新人" in role_str:
+                    for d in range(num_days):
+                        _model.Add(_shifts[(e, d, 'D')] == 0)
+                        _model.Add(_shifts[(e, d, 'E')] == 0)
+                        _model.Add(_shifts[(e, d, 'A残')] == 0)
+                # パート欄に値があるスタッフも夜勤・残業禁止
+                if str(staff_part_shifts[e]).strip() not in ["", "nan"]:
+                    for d in range(num_days):
+                        _model.Add(_shifts[(e, d, 'D')] == 0)
+                        _model.Add(_shifts[(e, d, 'E')] == 0)
+                        _model.Add(_shifts[(e, d, 'A残')] == 0)
             for e, staff_name in enumerate(staff_names):
                 tr = df_history[df_history.iloc[:, 0] == staff_name]
                 if not tr.empty:
@@ -1175,7 +1156,12 @@ if uploaded_file:
             for d in range(num_days):
                 _model.Add(sum(_shifts[(e, d, 'D')] for e in range(num_staff)) == night_req_list[d])
                 _model.Add(sum(_shifts[(e, d, 'A残')] for e in range(num_staff)) == overtime_req_list[d])
-                act_day = sum((_shifts[(e, d, 'A')] + _shifts[(e, d, 'A残')]) for e in range(num_staff) if "新人" not in str(staff_roles[e]))
+                # [修正④] 演算子優先度バグを修正（括弧追加）
+                act_day = sum(
+                    (_shifts[(e, d, 'A')] + _shifts[(e, d, 'A残')])
+                    for e in range(num_staff)
+                    if "新人" not in str(staff_roles[e])
+                )
                 req = day_req_list[d]; is_sun = ('日' in weekdays[d]); is_abs = (absolute_req_list[d] == "〇")
                 if is_abs:
                     _model.Add(act_day >= req)
@@ -1187,7 +1173,11 @@ if uploaded_file:
                 else:
                     if not m1: _model.Add(act_day >= req)
                     else: _model.Add(act_day >= req - 1)
-                l_score = sum((2 if "主任" in str(staff_roles[e]) or "リーダー" in str(staff_roles[e]) else 1 if "サブ" in str(staff_roles[e]) else 0) * (_shifts[(e, d, 'A')] + _shifts[(e, d, 'A残')]) for e in range(num_staff))
+                l_score = sum(
+                    (2 if "主任" in str(staff_roles[e]) or "リーダー" in str(staff_roles[e]) else 1 if "サブ" in str(staff_roles[e]) else 0)
+                    * (_shifts[(e, d, 'A')] + _shifts[(e, d, 'A残')])
+                    for e in range(num_staff)
+                )
                 if not sub: _model.Add(l_score >= 2)
                 else: _model.Add(l_score >= 1)
             for e in range(num_staff):
@@ -1199,6 +1189,11 @@ if uploaded_file:
             for e in range(num_staff):
                 for d in range(num_days - 1):
                     if not ot: _model.Add(_shifts[(e, d, 'A残')] + _shifts[(e, d + 1, 'A残')] <= 1)
+            # 残業不可日（日付指定＋曜日指定）の制約
+            for e in range(num_staff):
+                for d in ot_ng_days_list[e]:
+                    if d < num_days:
+                        _model.Add(_shifts[(e, d, 'A残')] == 0)
             for e in range(num_staff):
                 if staff_overtime_ok[e] != "×":
                     total_day_work = sum(_shifts[(e, d, 'A')] + _shifts[(e, d, 'A残')] for d in range(num_days))
@@ -1222,13 +1217,6 @@ if uploaded_file:
         ]
         ALL_ON = (True, True, True, True, True, True, True)
 
-        if 'min_compromise_result' not in st.session_state:
-            st.session_state.min_compromise_result = None
-        if 'step3_failed' not in st.session_state:
-            st.session_state.step3_failed = False
-        if 'card_selections' not in st.session_state:
-            st.session_state.card_selections = {}
-
         ALL_SEEDS = [7, 42, 137, 512, 9999, 31415, 271828, 100003, 777777, 999983]
         num_patterns = st.selectbox("🔢 作成するシフトのパターン数", [1, 2, 3, 4, 5], index=2)
         use_seeds = ALL_SEEDS[:num_patterns]
@@ -1241,17 +1229,19 @@ if uploaded_file:
                         solver, shifts = solve_shift(seed, False, False, False, False, False, False, False, True)
                         if solver: results.append((solver, shifts))
                     if results:
+                        # [修正⑮] locals()依存をなくし、セッションで管理
+                        st.session_state.shift_results = results
                         st.success(f"🎉 妥協なしで完璧なシフトが {len(results)} パターン組めました！")
                     else:
                         st.session_state.needs_compromise = True
                         st.session_state.min_compromise_result = None
                         st.session_state.step3_failed = False
+                        st.session_state.shift_results = []
                         st.rerun()
 
         else:
             st.error("⚠️ 妥協なしではシフトを組めませんでした。下の提案を確認してください。")
 
-            # ── 診断レポート ──
             df_staff_diag, staff_warnings, df_day_diag, day_warnings, congestion_days, global_issues = diagnose_infeasibility()
             with st.expander("🔍 **【原因診断レポート】** ← クリックして確認", expanded=False):
                 if global_issues:
@@ -1284,7 +1274,6 @@ if uploaded_file:
 
             st.markdown("---")
 
-            # ── STEP2：自動分析ボタン ──
             if st.button("🔎 【STEP 2】どの妥協が必要か自動で調べる（約1分）"):
                 progress = st.progress(0, text="全妥協案ONで確認中...")
                 can_all = solve_shift_fast(ALL_ON)
@@ -1294,19 +1283,19 @@ if uploaded_file:
                 else:
                     necessary = [True] * 7
                     for i in range(7):
-                        progress.progress((i + 1) / 8, text=f"「{COMPROMISE_LABELS[i]}」が不要か確認中... ({i + 1}/7)")
+                        remaining_sec = (7 - i) * 12
+                        progress.progress(
+                            (i + 1) / 8,
+                            text=f"「{COMPROMISE_LABELS[i]}」を検証中... ({i + 1}/7)　残り約{remaining_sec}秒"
+                        )
                         flags_test = list(ALL_ON)
                         flags_test[i] = False
                         if solve_shift_fast(tuple(flags_test)):
                             necessary[i] = False
                     progress.progress(1.0, text="分析完了！")
                     st.session_state.min_compromise_result = necessary
-                    # カード選択を初期化（必要なカードはデフォルトON）
                     st.session_state.card_selections = {i: necessary[i] for i in range(7)}
 
-            # =============================================
-            # 🃏 AI交渉カード UI（★ 新機能）
-            # =============================================
             if st.session_state.min_compromise_result is not None:
                 necessary = st.session_state.min_compromise_result
                 cards = generate_compromise_cards(necessary)
@@ -1325,13 +1314,11 @@ if uploaded_file:
 
                 st.markdown("")
 
-                # カードを2列で表示
                 card_cols = st.columns(2)
                 for idx, card in enumerate(cards):
                     col = card_cols[idx % 2]
                     cid = card["id"]
                     with col:
-                        # カードのHTML風表示
                         st.markdown(
                             f"""
                             <div style="
@@ -1359,7 +1346,6 @@ if uploaded_file:
                         st.session_state.card_selections[cid] = new_val
                         st.markdown("")
 
-                # 選択結果をフラグに変換
                 sel = st.session_state.card_selections
                 allow_minus_1         = sel.get(0, False)
                 allow_4_days          = sel.get(1, False)
@@ -1369,7 +1355,6 @@ if uploaded_file:
                 allow_night_consec_3  = sel.get(5, False)
                 allow_abs_plus_1      = True
 
-                # 許可したカードのサマリー
                 accepted = [cards[i]["title"] for i in range(len(cards)) if sel.get(cards[i]["id"], False)]
                 rejected = [cards[i]["title"] for i in range(len(cards)) if not sel.get(cards[i]["id"], False)]
 
@@ -1390,14 +1375,16 @@ if uploaded_file:
                             solver, shifts = solve_shift(seed, allow_minus_1, allow_4_days, allow_night_3, allow_sub_only, allow_ot_consec, allow_night_consec_3, False, allow_abs_plus_1)
                             if solver: results.append((solver, shifts))
                         if results:
+                            # [修正⑮] セッションに保存
+                            st.session_state.shift_results = results
                             st.success(f"✨ {len(results)}パターン完成！")
                             st.session_state.needs_compromise = False
                             st.session_state.step3_failed = False
                         else:
                             st.session_state.step3_failed = True
+                            st.session_state.shift_results = []
                             st.rerun()
 
-                # ── STEP4：日曜-1 ──
                 if st.session_state.step3_failed:
                     st.error("❌ 選んだ妥協案でもシフトが組めませんでした。")
                     st.markdown("---")
@@ -1412,7 +1399,6 @@ if uploaded_file:
                             if available < day_req_list[d]:
                                 sun_risky.append(f"{date_columns[d]}日(日)")
 
-                    sun_detail = ""
                     if sun_risky:
                         days_str = "・".join(sun_risky[:3]) + ("など" if len(sun_risky) > 3 else "")
                         sun_detail = f"**{days_str}** の日曜日で日勤人数が不足する可能性があります。リーダーが在勤している日曜に限り、設定人数より1名少ない状態を許容します。"
@@ -1446,16 +1432,22 @@ if uploaded_file:
                                 solver, shifts = solve_shift(seed, allow_minus_1, allow_4_days, allow_night_3, allow_sub_only, allow_ot_consec, allow_night_consec_3, allow_sun_minus_1, allow_abs_plus_1)
                                 if solver: results.append((solver, shifts))
                             if results:
+                                # [修正⑮] セッションに保存
+                                st.session_state.shift_results = results
                                 st.success(f"✨ {len(results)}パターン完成！")
                                 st.session_state.needs_compromise = False
                                 st.session_state.step3_failed = False
                             else:
+                                st.session_state.shift_results = []
                                 st.error("😭 まだ組めません。希望休や人数設定を見直してください。")
 
         # =============================================
-        # 結果表示・Excel出力（変更なし）
+        # 結果表示・Excel出力
         # =============================================
-        if 'results' in locals() and results:
+        # [修正⑮] locals()依存をなくし、session_stateから参照
+        results = st.session_state.get("shift_results", [])
+
+        if results:
             cols = []
             for d_val, w_val in zip(date_columns, weekdays):
                 try:
@@ -1464,8 +1456,8 @@ if uploaded_file:
                     else: cols.append(f"{d_val}({w_val})")
                 except ValueError: cols.append(f"{d_val}({w_val})")
 
-            hope_off_set = set()       # 希望休（黄色）
-            hope_shift_dict = {}       # 希望シフト（水色）: (e, d) -> シフト種別
+            hope_off_set = set()
+            hope_shift_dict = {}
             VALID_SHIFTS = {'A', 'A残', 'D', 'E', '公'}
             for e, staff_name in enumerate(staff_names):
                 tr = df_history[df_history.iloc[:, 0] == staff_name]
@@ -1499,87 +1491,171 @@ if uploaded_file:
                     df_res['夜勤(D)回数'] = (df_res[cols] == 'D').sum(axis=1)
                     df_res['公休回数'] = (df_res[cols] == '公').sum(axis=1)
 
-                    sum_A = {"スタッフ名": "【日勤(A/P) 合計人数】"}
-                    sum_Az = {"スタッフ名": "【残業(A残) 合計人数】"}
-                    sum_D = {"スタッフ名": "【夜勤(D) 人数】"}
-                    sum_E = {"スタッフ名": "【夜勤明け(E) 人数】"}
-                    for c in ['日勤(A/P)回数', '残業(A残)回数', '夜勤(D)回数', '公休回数']:
-                        sum_A[c] = ""; sum_Az[c] = ""; sum_D[c] = ""; sum_E[c] = ""
+
+                    # =============================================
+                    # 📝 編集テーブル
+                    # =============================================
+
+                    # スタッフごとのPシフトを収集してドロップダウン選択肢を構築
+                    BASE_SHIFTS = ['A', 'A残', 'D', 'E', '公']
+                    all_shift_options = list(dict.fromkeys(
+                        BASE_SHIFTS + [
+                            str(staff_part_shifts[e]).strip()
+                            for e in range(num_staff)
+                            if str(staff_part_shifts[e]).strip() not in ["", "nan"]
+                        ]
+                    ))
+
+                    # セッションキー（パターンごとに独立）
+                    edit_key = f"edited_df_{i}"
+                    if edit_key not in st.session_state:
+                        st.session_state[edit_key] = df_res[["スタッフ名"] + cols].copy()
+
+                    st.markdown("#### ✏️ シフト編集テーブル")
+                    st.caption("各セルをクリックするとドロップダウンで変更できます。編集後は「編集内容を反映」を押してください。")
+
+                    column_config = {
+                        "スタッフ名": st.column_config.TextColumn("スタッフ名", disabled=True)
+                    }
+                    for col_name in cols:
+                        column_config[col_name] = st.column_config.SelectboxColumn(
+                            col_name,
+                            options=all_shift_options,
+                            required=True,
+                        )
+
+                    edited_df = st.data_editor(
+                        st.session_state[edit_key],
+                        column_config=column_config,
+                        use_container_width=True,
+                        hide_index=True,
+                        key=f"data_editor_{i}",
+                        num_rows="fixed",
+                    )
+
+                    if st.button("🔁 編集内容を反映", key=f"apply_edit_{i}"):
+                        st.session_state[edit_key] = edited_df.copy()
+                        st.success("✅ 編集内容を反映しました。")
+
+                    # 反映済みの df を使って以降の集計・出力に使う
+                    df_res_edited = st.session_state[edit_key].copy()
+                    df_res_edited['日勤(A/P)回数'] = df_res_edited[cols].apply(
+                        lambda x: x.str.contains('A|P|Ｐ', na=False) & ~x.str.contains('残', na=False)
+                    ).sum(axis=1)
+                    df_res_edited['残業(A残)回数'] = (df_res_edited[cols] == 'A残').sum(axis=1)
+                    df_res_edited['夜勤(D)回数']   = (df_res_edited[cols] == 'D').sum(axis=1)
+                    df_res_edited['公休回数']       = (df_res_edited[cols] == '公').sum(axis=1)
+
+                    # ── 集計行を再計算して別表示 ──
+                    sum_A2  = {"ラベル": "【日勤(A/P) 合計人数】"}
+                    sum_Az2 = {"ラベル": "【残業(A残) 合計人数】"}
+                    sum_D2  = {"ラベル": "【夜勤(D) 人数】"}
+                    sum_E2  = {"ラベル": "【夜勤明け(E) 人数】"}
+                    sum_req = {"ラベル": "【日勤 設定人数】"}
                     for d, c in enumerate(cols):
-                        sum_A[c] = sum(1 for e in range(num_staff) if str(df_res.loc[e, c]) in ['A', 'A残'] or 'P' in str(df_res.loc[e, c]) and "新人" not in str(staff_roles[e]))
-                        sum_Az[c] = (df_res[c] == 'A残').sum()
-                        sum_D[c] = (df_res[c] == 'D').sum()
-                        sum_E[c] = (df_res[c] == 'E').sum()
+                        sum_A2[c] = sum(
+                            1 for e in range(num_staff)
+                            if (str(df_res_edited.loc[e, c]) in ['A', 'A残'] or 'P' in str(df_res_edited.loc[e, c]))
+                            and "新人" not in str(staff_roles[e])
+                        )
+                        sum_Az2[c] = int((df_res_edited[c] == 'A残').sum())
+                        sum_D2[c]  = int((df_res_edited[c] == 'D').sum())
+                        sum_E2[c]  = int((df_res_edited[c] == 'E').sum())
+                        sum_req[c] = day_req_list[d]
 
-                    df_fin = pd.concat([df_res, pd.DataFrame([sum_A, sum_Az, sum_D, sum_E])], ignore_index=True)
+                    df_sum = pd.DataFrame([sum_req, sum_A2, sum_Az2, sum_D2, sum_E2])
 
-                    def highlight_warnings(df):
+                    def highlight_sum(df):
                         styles = pd.DataFrame('', index=df.index, columns=df.columns)
-                        for d, col_name in enumerate(cols):
-                            if "土" in col_name: styles.iloc[:, d + 1] = 'background-color: #E6F2FF;'
-                            elif "日" in col_name or "祝" in col_name: styles.iloc[:, d + 1] = 'background-color: #FFE6E6;'
-                        for e in range(num_staff):
-                            for d in range(num_days):
-                                if (e, d) in hope_off_set:
-                                    styles.loc[e, cols[d]] = 'background-color: #FFFF00; font-weight: bold;'
-                                elif (e, d) in hope_shift_dict:
-                                    styles.loc[e, cols[d]] = 'background-color: #FFFF00; font-weight: bold;'
-                        for d, col_name in enumerate(cols):
-                            actual_a = df.loc[len(staff_names), col_name]
-                            target_a = day_req_list[d]
-                            if actual_a != "":
-                                if actual_a < target_a: styles.loc[len(staff_names), col_name] = 'background-color: #FFCCCC; color: red; font-weight: bold;'
-                                elif actual_a > target_a: styles.loc[len(staff_names), col_name] = 'background-color: #CCFFFF; color: blue; font-weight: bold;'
-                        for e in range(num_staff):
-                            for d in range(num_days):
-                                def is_day_work(day_idx):
-                                    if day_idx >= num_days: return False
-                                    v = str(df.loc[e, cols[day_idx]])
-                                    return v == 'A' or v == 'A残' or 'P' in v or 'Ｐ' in v
-                                if is_day_work(d) and is_day_work(d + 1) and is_day_work(d + 2) and is_day_work(d + 3):
-                                    for k in range(4): styles.loc[e, cols[d + k]] = 'background-color: #FFFF99; font-weight: bold; color: black;'
-                                if d + 3 < num_days:
-                                    if is_day_work(d) and is_day_work(d + 1) and is_day_work(d + 2) and str(df.loc[e, cols[d + 3]]) == 'D':
-                                        for k in range(4): styles.loc[e, cols[d + k]] = 'background-color: #FFD580; font-weight: bold; color: black;'
-                                if d + 8 < num_days:
-                                    if str(df.loc[e, cols[d]]) == 'D' and str(df.loc[e, cols[d + 3]]) == 'D' and str(df.loc[e, cols[d + 6]]) == 'D':
-                                        for k in range(9): styles.loc[e, cols[d + k]] = 'background-color: #E6E6FA; font-weight: bold; color: black;'
+                        for d, c in enumerate(cols):
+                            try:
+                                req_val    = int(df.loc[0, c])
+                                actual_val = int(df.loc[1, c])
+                                if actual_val < req_val:
+                                    styles.loc[1, c] = 'background-color:#FFCCCC; color:red; font-weight:bold;'
+                                elif actual_val > req_val:
+                                    styles.loc[1, c] = 'background-color:#CCFFFF; color:blue; font-weight:bold;'
+                            except Exception:
+                                pass
                         return styles
 
-                    st.dataframe(df_fin.style.apply(highlight_warnings, axis=None))
+                    st.markdown("#### 📊 集計行")
+                    st.dataframe(
+                        df_sum.style.apply(highlight_sum, axis=None),
+                        use_container_width=True,
+                        hide_index=True,
+                    )
 
                     # =============================================
-                    # 📊 振り返りレポート & 有休・夏冬休管理
+                    # ① 連続勤務アラート（4連勤以上）
                     # =============================================
+                    consec_alerts = []
+                    for e in range(num_staff):
+                        cur = 0
+                        start_d = 0
+                        for d in range(num_days):
+                            v = str(df_res_edited.loc[e, cols[d]])
+                            is_work = (v in ['A', 'A残'] or ('P' in v and 'nan' not in v))
+                            if is_work:
+                                if cur == 0:
+                                    start_d = d
+                                cur += 1
+                            else:
+                                if cur >= 4:
+                                    start_label = date_columns[start_d]
+                                    end_label   = date_columns[start_d + cur - 1]
+                                    consec_alerts.append(
+                                        f"**{staff_names[e]}**：{start_label}〜{end_label}日 （{cur}連勤）"
+                                    )
+                                cur = 0
+                        # 月末まで連勤が続いている場合
+                        if cur >= 4:
+                            start_label = date_columns[start_d]
+                            end_label   = date_columns[start_d + cur - 1]
+                            consec_alerts.append(
+                                f"**{staff_names[e]}**：{start_label}〜{end_label}日 （{cur}連勤）"
+                            )
+
+                    if consec_alerts:
+                        st.markdown("#### ⚠️ 連続勤務アラート（4連勤以上）")
+                        for a in consec_alerts:
+                            st.warning(a)
+
+                    # 振り返りレポート・Excel出力用のdf_finはdf_res_editedベースで再構成
+                    df_fin = pd.concat(
+                        [df_res_edited, pd.DataFrame([
+                            {"スタッフ名": "【日勤(A/P) 合計人数】", **{c: sum_A2[c]  for c in cols}},
+                            {"スタッフ名": "【残業(A残) 合計人数】", **{c: sum_Az2[c] for c in cols}},
+                            {"スタッフ名": "【夜勤(D) 人数】",       **{c: sum_D2[c]  for c in cols}},
+                            {"スタッフ名": "【夜勤明け(E) 人数】",   **{c: sum_E2[c]  for c in cols}},
+                        ])],
+                        ignore_index=True
+                    )
+                    for col_cnt in ['日勤(A/P)回数', '残業(A残)回数', '夜勤(D)回数', '公休回数']:
+                        df_fin[col_cnt] = df_res_edited[col_cnt].tolist() + ["", "", "", ""]
+
                     with st.expander("📊 振り返りレポート & 有休・休暇管理を見る", expanded=False):
                         df_report, alerts, red_alerts, march_forced = build_review_report(df_fin, cols)
 
-                        # ── 休暇優先順位の説明 ──
                         st.info("📋 **休暇優先順位**：公休（9日）＞ 夏季休暇（7〜9月・3日）＞ 冬季休暇（12〜2月・4日）＞ 年休（4〜2月・年5日）")
                         st.markdown("---")
 
-                        # ── 🚨 赤色：強制対応アラート ──
                         if red_alerts:
                             st.markdown("### 🚨 要対応（今月シフトに必ず組み込んでください）")
-                            for a in red_alerts:
-                                st.error(a)
+                            for a in red_alerts: st.error(a)
                             st.markdown("---")
 
-                        # ── 3月強制消化スタッフ一覧 ──
                         if target_month == 3 and march_forced:
                             st.error("### 🚨 3月シフト：以下のスタッフに有休を必ず組み込んでください")
                             for mf in march_forced:
                                 st.error(f"　👤 **{mf['name']}**：有休 **{mf['days']}日** を3月中に取得させてください。")
                             st.markdown("---")
 
-                        # ── 🟡 黄色：注意アラート ──
                         if alerts:
                             st.markdown("### ⚠️ 注意・促しアラート")
-                            for a in alerts:
-                                st.warning(a)
+                            for a in alerts: st.warning(a)
                             st.markdown("---")
 
-                        # ── スタッフ別サマリー表 ──
                         st.markdown("### 👥 スタッフ別サマリー")
                         display_cols = [
                             "スタッフ名", "役割",
@@ -1598,12 +1674,8 @@ if uploaded_file:
                             if "🟢" in s: return "background-color:#D8F5D8;"
                             return ""
 
-                        st.dataframe(
-                            df_disp.style.applymap(color_report, subset=["判定"]),
-                            use_container_width=True
-                        )
+                        st.dataframe(df_disp.style.applymap(color_report, subset=["判定"]), use_container_width=True)
 
-                        # ── 有休進捗バー ──
                         st.markdown("### 📅 有休取得進捗（4月〜2月 年5日ルール）")
                         remain_m = remaining_months_to_feb(target_month)
                         if target_month == 3:
@@ -1611,12 +1683,11 @@ if uploaded_file:
                         elif remain_m == 0:
                             st.info("📌 2月末が締め切りです。今月取得できなかった分は3月に強制消化になります。")
                         else:
-                            st.info(f"📌 現在 **{target_month}月**。2月末まで残り **{remain_m}ヶ月**。年5日取得が目標です（優先度：公休＞夏冬休＞年休）。")
+                            st.info(f"📌 現在 **{target_month}月**。2月末まで残り **{remain_m}ヶ月**。年5日取得が目標です。")
 
                         progress_data = df_report[["スタッフ名", "有休取得済", "年間義務残"]].set_index("スタッフ名")
                         st.bar_chart(progress_data)
 
-                        # ── 夏冬休グラフ（対象期間のみ） ──
                         if target_month in SUMMER_MONTHS:
                             st.markdown("### ☀️ 夏季休暇残日数（7〜9月で3日取得）")
                             st.bar_chart(df_report[["スタッフ名", "夏休残"]].set_index("スタッフ名"))
@@ -1624,7 +1695,6 @@ if uploaded_file:
                             st.markdown("### ❄️ 冬季休暇残日数（12〜2月で4日取得）")
                             st.bar_chart(df_report[["スタッフ名", "冬休残"]].set_index("スタッフ名"))
 
-                        # ── 夜勤・残業グラフ ──
                         st.markdown("### 📈 今月の夜勤・残業回数")
                         st.bar_chart(df_report[["スタッフ名", "今月夜勤", "今月残業"]].set_index("スタッフ名"))
 
@@ -1632,14 +1702,13 @@ if uploaded_file:
                         st.info("💾 年間管理シートは下の「📥 シフト管理ファイルをダウンロード」に含まれています。")
 
                     # =============================================
-                    # 📥 統合Excelダウンロード（1ファイルに全シート）
+                    # Excel出力
                     # =============================================
                     st.markdown("---")
                     st.markdown(f"### 📥 パターン {i + 1} をダウンロード")
                     st.caption("完成シフト・予定実績・年間管理がすべて1ファイルに含まれます。来月もこのファイルをアップロードしてください。")
 
-                    # Excel用：列名を日付数字のみに変換（曜日は2行目に別途書き込む）
-                    cols_day   = []
+                    cols_day = []
                     for d in range(num_days):
                         try:
                             cols_day.append(str(int(date_columns[d])))
@@ -1655,10 +1724,8 @@ if uploaded_file:
                     output = io.BytesIO()
                     with pd.ExcelWriter(output, engine='openpyxl') as writer:
 
-                        # ── ① 完成シフトシート ──
                         df_fin_xl.to_excel(writer, index=False, sheet_name='完成シフト')
                         worksheet = writer.sheets['完成シフト']
-                        # 曜日行を2行目に挿入
                         worksheet.insert_rows(2)
                         weekday_colors = {"月":"FFFFFF","火":"FFFFFF","水":"FFFFFF","木":"FFFFFF","金":"FFFFFF","土":"BDD7EE","日":"FFCCCC","祝":"FFCCCC"}
                         worksheet.cell(row=2, column=1).value = ""
@@ -1673,8 +1740,9 @@ if uploaded_file:
                             c.value = label
                             bg = "FFCCCC" if is_hol else weekday_colors.get(wday, "FFFFFF")
                             c.fill = PatternFill(start_color=bg, end_color=bg, fill_type="solid")
-                        font_meiryo = Font(name='Meiryo')
-                        border_thin = Border(left=Side(style='thin'), right=Side(style='thin'), top=Side(style='thin'), bottom=Side(style='thin'))
+
+                        font_meiryo  = Font(name='Meiryo')
+                        border_thin  = Border(left=Side(style='thin'), right=Side(style='thin'), top=Side(style='thin'), bottom=Side(style='thin'))
                         align_center = Alignment(horizontal='center', vertical='center')
                         align_left   = Alignment(horizontal='left',  vertical='center')
                         fill_sat        = PatternFill(start_color="E6F2FF", end_color="E6F2FF", fill_type="solid")
@@ -1685,25 +1753,39 @@ if uploaded_file:
                         fill_n3         = PatternFill(start_color="FFD580", end_color="FFD580", fill_type="solid")
                         fill_n3_consec  = PatternFill(start_color="E6E6FA", end_color="E6E6FA", fill_type="solid")
                         fill_hope_off   = PatternFill(start_color="FFFF00", end_color="FFFF00", fill_type="solid")
+                        # 希望シフトも希望休と同じ黄色
                         fill_hope_shift = PatternFill(start_color="FFFF00", end_color="FFFF00", fill_type="solid")
+
                         for e in range(num_staff - 1, -1, -1):
                             worksheet.insert_rows(e + 3)
+
                         def staff_row(e): return (e + 1) * 2 + 1
+
                         sum_row_start = num_staff * 2 + 3
+
+                        # [修正⑩] 列幅設定は行挿入の後に実行
+                        worksheet.column_dimensions['A'].width = 14
+                        for col_idx in range(2, num_days + 2):
+                            col_letter = worksheet.cell(row=1, column=col_idx).column_letter
+                            worksheet.column_dimensions[col_letter].width = 5
+
                         for row in worksheet.iter_rows(min_row=1, max_row=worksheet.max_row, min_col=1, max_col=worksheet.max_column):
                             for cell in row:
                                 cell.font = font_meiryo; cell.border = border_thin
                                 cell.alignment = align_left if cell.column == 1 else align_center
+
                         for c_idx, col_name in enumerate(cols):
                             if "土" in col_name:
                                 for r_idx in range(1, worksheet.max_row + 1): worksheet.cell(row=r_idx, column=c_idx + 2).fill = fill_sat
                             elif "日" in col_name or "祝" in col_name:
                                 for r_idx in range(1, worksheet.max_row + 1): worksheet.cell(row=r_idx, column=c_idx + 2).fill = fill_sun
+
                         for d, col_name in enumerate(cols):
                             actual_a = df_fin.loc[len(staff_names), col_name]
                             if actual_a != "":
                                 if actual_a < day_req_list[d]: worksheet.cell(row=sum_row_start, column=d + 2).fill = fill_short
                                 elif actual_a > day_req_list[d]: worksheet.cell(row=sum_row_start, column=d + 2).fill = fill_over
+
                         for e in range(num_staff):
                             xl_row = staff_row(e)
                             for d in range(num_days):
@@ -1714,6 +1796,7 @@ if uploaded_file:
                                 if (e, d) in hope_off_set:
                                     worksheet.cell(row=xl_row, column=d + 2).fill = fill_hope_off; continue
                                 if (e, d) in hope_shift_dict:
+                                    # 希望シフトも黄色（希望休と同色）
                                     worksheet.cell(row=xl_row, column=d + 2).fill = fill_hope_shift; continue
                                 if is_d_work(d) and is_d_work(d+1) and is_d_work(d+2) and is_d_work(d+3):
                                     for k in range(4): worksheet.cell(row=xl_row, column=d+k+2).fill = fill_4days
@@ -1724,35 +1807,28 @@ if uploaded_file:
                                     if str(df_fin.loc[e, cols[d]]) == 'D' and str(df_fin.loc[e, cols[d+3]]) == 'D' and str(df_fin.loc[e, cols[d+6]]) == 'D':
                                         for k in range(9): worksheet.cell(row=xl_row, column=d+k+2).fill = fill_n3_consec
 
-                        # ── ② 予定・実績シート ──
-                        # スタッフごとに「予定」「実績」の2行を作成
+                        # ── 予定・実績シート ──
                         plan_actual_rows = []
                         for e in range(num_staff):
-                            # 予定行（アプリが自動入力）
                             row_plan = {"スタッフ名": staff_names[e], "区分": "予定"}
-                            for d in range(num_days):
-                                row_plan[cols[d]] = str(df_fin.loc[e, cols[d]])
+                            for d in range(num_days): row_plan[cols[d]] = str(df_fin.loc[e, cols[d]])
                             plan_actual_rows.append(row_plan)
-                            # 実績行（変更があった日だけ手入力。空欄＝予定通り）
                             row_actual = {"スタッフ名": staff_names[e], "区分": "実績"}
-                            for d in range(num_days):
-                                row_actual[cols[d]] = ""
+                            for d in range(num_days): row_actual[cols[d]] = ""
                             plan_actual_rows.append(row_actual)
 
                         df_pa = pd.DataFrame(plan_actual_rows)
                         df_pa.to_excel(writer, index=False, sheet_name='予定・実績')
                         ws_pa = writer.sheets['予定・実績']
 
-                        # 書式設定
-                        fill_plan_hdr   = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")  # 予定行 濃青
-                        fill_actual_hdr = PatternFill(start_color="70AD47", end_color="70AD47", fill_type="solid")  # 実績行 緑
-                        fill_plan_cell  = PatternFill(start_color="DDEEFF", end_color="DDEEFF", fill_type="solid")  # 予定セル 薄青
-                        fill_actual_cell= PatternFill(start_color="F2F9EE", end_color="F2F9EE", fill_type="solid")  # 実績セル 薄緑（入力欄）
+                        fill_plan_hdr   = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
+                        fill_actual_hdr = PatternFill(start_color="70AD47", end_color="70AD47", fill_type="solid")
+                        fill_plan_cell  = PatternFill(start_color="DDEEFF", end_color="DDEEFF", fill_type="solid")
+                        fill_actual_cell= PatternFill(start_color="F2F9EE", end_color="F2F9EE", fill_type="solid")
                         font_white      = Font(name='Meiryo', bold=True, color="FFFFFF")
                         font_normal     = Font(name='Meiryo')
                         font_gray       = Font(name='Meiryo', color="888888", italic=True)
 
-                        # ヘッダー行
                         for cell in ws_pa[1]:
                             cell.fill = fill_plan_hdr; cell.font = font_white
                             cell.alignment = align_center; cell.border = border_thin
@@ -1761,7 +1837,6 @@ if uploaded_file:
                         for col_idx in range(3, num_days + 3):
                             ws_pa.column_dimensions[ws_pa.cell(row=1, column=col_idx).column_letter].width = 5
 
-                        # データ行の色分け
                         for row_idx in range(2, len(plan_actual_rows) + 2):
                             kubun_cell = ws_pa.cell(row=row_idx, column=2)
                             is_plan = (kubun_cell.value == "予定")
@@ -1770,28 +1845,21 @@ if uploaded_file:
                                 cell.border = border_thin
                                 cell.alignment = align_center if col_idx > 1 else align_left
                                 if col_idx <= 2:
-                                    # スタッフ名・区分列
                                     cell.fill = fill_plan_hdr if is_plan else fill_actual_hdr
                                     cell.font = font_white
                                 elif is_plan:
-                                    cell.fill = fill_plan_cell
-                                    cell.font = font_normal
+                                    cell.fill = fill_plan_cell; cell.font = font_normal
                                 else:
-                                    cell.fill = fill_actual_cell
-                                    cell.font = font_gray
-                                    if cell.value == "" or cell.value is None:
-                                        cell.value = None  # 空欄を明示（入力欄として）
+                                    cell.fill = fill_actual_cell; cell.font = font_gray
+                                    if cell.value == "" or cell.value is None: cell.value = None
 
-                        # 土日祝の列色（予定・実績どちらも）
                         for d, col_name in enumerate(cols):
                             col_idx = d + 3
-                            col_letter = ws_pa.cell(row=1, column=col_idx).column_letter
                             if "土" in col_name:
                                 ws_pa.cell(row=1, column=col_idx).fill = PatternFill(start_color="5B9BD5", end_color="5B9BD5", fill_type="solid")
                             elif "日" in col_name or "祝" in col_name:
                                 ws_pa.cell(row=1, column=col_idx).fill = PatternFill(start_color="C00000", end_color="C00000", fill_type="solid")
 
-                        # 使い方メモを末尾に追記
                         note_row = len(plan_actual_rows) + 3
                         ws_pa.cell(row=note_row, column=1).value = "【記入方法】"
                         ws_pa.cell(row=note_row, column=1).font = Font(name='Meiryo', bold=True)
@@ -1801,7 +1869,7 @@ if uploaded_file:
                         for nr in range(note_row, note_row+4):
                             ws_pa.cell(row=nr, column=1).font = Font(name='Meiryo', color="555555")
 
-                        # ── ③ 年間管理シート ──
+                        # ── 年間管理シート ──
                         df_report_for_annual, _, _, _ = build_review_report(df_fin, cols)
                         df_new_annual = build_annual_excel(df_report_for_annual)
                         df_new_annual.to_excel(writer, index=False, sheet_name="年間管理")
@@ -1827,12 +1895,9 @@ if uploaded_file:
                                 if ci is None: continue
                                 val = ws_annual.cell(row=row_idx, column=ci).value or 0
                                 fval = float(val)
-                                if red_ok and fval > threshold:
-                                    ws_annual.cell(row=row_idx, column=ci).fill = alert_fill
-                                elif not red_ok and fval <= threshold:
-                                    ws_annual.cell(row=row_idx, column=ci).fill = warn_fill
-                                elif red_ok:
-                                    ws_annual.cell(row=row_idx, column=ci).fill = ok_fill
+                                if red_ok and fval > threshold: ws_annual.cell(row=row_idx, column=ci).fill = alert_fill
+                                elif not red_ok and fval <= threshold: ws_annual.cell(row=row_idx, column=ci).fill = warn_fill
+                                elif red_ok: ws_annual.cell(row=row_idx, column=ci).fill = ok_fill
                         ws_annual.column_dimensions['A'].width = 14
 
                     st.download_button(
@@ -1843,6 +1908,115 @@ if uploaded_file:
                         key=f"dl_btn_{i}"
                     )
                     st.caption("📋 ファイルの中身：① 完成シフト（印刷用）　② 予定・実績（月中に実績を手入力）　③ 年間管理（来月引き継ぎ用）")
+
+                    # =============================================
+                    # ⑤ PDF用HTML出力
+                    # =============================================
+                    def build_shift_html(df_edited, df_sum_tbl, cols_list, weekdays_list, day_req):
+                        # 曜日→背景色
+                        def col_bg(col_name):
+                            if "祝" in col_name or "日" in col_name: return "#FFE6E6"
+                            if "土" in col_name: return "#E6F2FF"
+                            return "#FFFFFF"
+
+                        # ヘッダー行（スタッフ名＋日付のみ、回数列なし）
+                        header_cells = "<th style='min-width:72px;padding:4px 6px;border:1px solid #999;background:#4472C4;color:#fff;'>スタッフ名</th>"
+                        for c in cols_list:
+                            bg = col_bg(c)
+                            label = str(c).split("(")[0]
+                            header_cells += f"<th style='min-width:28px;padding:2px 3px;border:1px solid #999;background:{bg};font-size:11px;'>{label}</th>"
+
+                        # 曜日行
+                        wday_cells = "<td style='padding:2px 4px;border:1px solid #999;background:#4472C4;color:#fff;font-size:10px;'>曜日</td>"
+                        for d, c in enumerate(cols_list):
+                            bg = col_bg(c)
+                            wday_cells += f"<td style='padding:2px 3px;border:1px solid #999;background:{bg};font-size:11px;text-align:center;'>{weekdays_list[d]}</td>"
+
+                        # スタッフ行
+                        # 直接入力（hope_off_set / hope_shift_dict）のセルのみ緑、それ以外は黒
+                        staff_rows = ""
+                        for e in range(num_staff):
+                            cells = f"<td style='padding:2px 6px;border:1px solid #999;white-space:nowrap;'>{staff_names[e]}</td>"
+                            for d, c in enumerate(cols_list):
+                                val = str(df_edited.loc[e, c])
+                                bg = col_bg(c)
+                                # 直接入力セルは緑、それ以外は黒
+                                if (e, d) in hope_off_set or (e, d) in hope_shift_dict:
+                                    color = "#007700"
+                                else:
+                                    color = "#000000"
+                                cells += (f"<td style='padding:2px 3px;border:1px solid #999;"
+                                          f"background:{bg};text-align:center;font-size:11px;color:{color};'>"
+                                          f"{val}</td>")
+                            row_bg = "#FFFFFF" if e % 2 == 0 else "#F7F7F7"
+                            staff_rows += f"<tr style='background:{row_bg};'>{cells}</tr>"
+
+                        # 集計行
+                        sum_rows = ""
+                        sum_labels = ["日勤 設定人数", "日勤(A/P) 合計", "残業(A残) 合計", "夜勤(D) 人数", "夜勤明け(E) 人数"]
+                        sum_bgs    = ["#D9E1F2", "#DDEEFF", "#F2F9EE", "#FFF5CC", "#F5F5F5"]
+                        for r_idx, (lbl, bg) in enumerate(zip(sum_labels, sum_bgs)):
+                            cells = f"<td style='padding:2px 6px;border:1px solid #999;background:{bg};font-weight:bold;font-size:11px;'>{lbl}</td>"
+                            for d, c in enumerate(cols_list):
+                                val = df_sum_tbl.loc[r_idx, c] if c in df_sum_tbl.columns else ""
+                                col_color = "#000"
+                                cell_bg = bg
+                                if r_idx == 1:
+                                    try:
+                                        if int(val) < int(day_req[d]):
+                                            cell_bg = "#FFCCCC"; col_color = "red"
+                                        elif int(val) > int(day_req[d]):
+                                            cell_bg = "#CCFFFF"; col_color = "blue"
+                                    except Exception:
+                                        pass
+                                cells += (f"<td style='padding:2px 3px;border:1px solid #999;"
+                                          f"background:{cell_bg};text-align:center;font-size:11px;color:{col_color};'>"
+                                          f"{val}</td>")
+                            sum_rows += f"<tr>{cells}</tr>"
+
+                        html = f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<title>シフト表 {target_year}/{target_month:02d} パターン{i+1}</title>
+<style>
+  body {{ font-family: 'Meiryo', 'MS Gothic', sans-serif; font-size: 12px; margin: 10px; }}
+  h2 {{ font-size: 14px; margin-bottom: 6px; }}
+  table {{ border-collapse: collapse; width: 100%; }}
+  @media print {{
+    body {{ margin: 5mm; }}
+    h2 {{ font-size: 12px; }}
+    table {{ font-size: 10px; }}
+  }}
+</style>
+</head><body>
+<h2>📅 シフト表　{target_year}年{target_month:02d}月　パターン{i+1}</h2>
+<table>
+  <thead>
+    <tr>{header_cells}</tr>
+    <tr>{wday_cells}</tr>
+  </thead>
+  <tbody>
+    {staff_rows}
+    {sum_rows}
+  </tbody>
+</table>
+<p style="font-size:10px;margin-top:8px;color:#666;">
+  印刷してPDFに保存：ブラウザで開いて Ctrl+P（Mac: ⌘+P）→「PDFに保存」を選択
+</p>
+</body></html>"""
+                        return html
+
+                    html_content = build_shift_html(
+                        df_res_edited, df_sum,
+                        cols, weekdays, day_req_list
+                    )
+                    st.download_button(
+                        label=f"🖨️ PDF用HTMLをダウンロード（パターン {i + 1}）",
+                        data=html_content.encode("utf-8"),
+                        file_name=f"シフト表_{target_year}{target_month:02d}_パターン{i + 1}.html",
+                        mime="text/html",
+                        key=f"dl_html_{i}"
+                    )
+                    st.caption("💡 ダウンロードしたHTMLファイルをブラウザで開き、Ctrl+P（Mac: ⌘+P）→「PDFに保存」でPDF化できます。")
 
     except Exception as e:
         st.error(f"⚠️ エラーが発生しました: エクセルの形式が間違っているか、空白の行があります。({e})")
